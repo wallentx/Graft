@@ -37,6 +37,18 @@ enum Cmd {
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
+    /// Who calls a symbol (or, with --direction out, what it calls).
+    Callers {
+        symbol: String,
+        /// Follow outgoing edges instead of incoming.
+        #[arg(long, value_parser = ["in", "out"], default_value = "in")]
+        direction: String,
+        /// How far to walk. `all` follows every connected edge.
+        #[arg(long, default_value = "1")]
+        depth: String,
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
     /// Report what the store knows about a repo.
     Status {
         #[arg(default_value = ".")]
@@ -123,6 +135,35 @@ fn main() -> Result<()> {
             }
             if r.unreadable > 0 {
                 eprintln!("\n{} indexed file(s) could not be read", r.unreadable);
+            }
+        }
+
+        Cmd::Callers { symbol, direction, depth, path } => {
+            let root = repo::root_of(&path)?;
+            let conn = db::open(&store)?;
+            let Some(repo_id) = index::repo_id_of(&conn, &root)? else {
+                eprintln!("{}", not_indexed(&root));
+                std::process::exit(2);
+            };
+            let max = if depth == "all" { usize::MAX } else { depth.parse().unwrap_or(1) };
+            let out = direction == "out";
+            let (seeds, reached) = index::callers(&conn, repo_id, &symbol, out, max)?;
+            if seeds.is_empty() {
+                eprintln!("no symbol named {symbol:?} — check the spelling, or run `graft build`");
+                std::process::exit(2);
+            }
+            for (_, name, kind, p, s0, s1) in &seeds {
+                println!("{name} · {kind} · {p}:L{s0}-L{s1}");
+            }
+            if reached.is_empty() {
+                println!("  (no {} edges)", if out { "outgoing" } else { "incoming" });
+            }
+            for r in &reached {
+                let arrow = if out { "→" } else { "←" };
+                println!(
+                    "  {} {} {} ({}:L{}-L{}) [depth {}]",
+                    r.edge, arrow, r.name, r.path, r.start_line, r.end_line, r.depth
+                );
             }
         }
 

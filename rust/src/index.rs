@@ -58,14 +58,32 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
 
     // Pass 1: symbols. Call targets cannot be resolved until every file's symbols
     // exist, because a callee is usually defined somewhere else.
-    let mut pending: Vec<(Vec<i64>, extract::Extracted)> = Vec::new();
+    let mut pending: Vec<(String, Vec<i64>, extract::Extracted)> = Vec::new();
     let mut by_name: HashMap<String, Vec<i64>> = HashMap::new();
     // (class, method) -> ids. What a receiver-typed call resolves against.
     let mut by_container: HashMap<(String, String), Vec<i64>> = HashMap::new();
     let mut n_symbols = 0usize;
 
+    // A file is a node, like every other symbol. `contains` hangs off it, `map`
+    // groups by it, and imports connect files to files. Modelling it as a row
+    // rather than a special case keeps every traversal uniform.
+    let mut file_symbol: HashMap<String, i64> = HashMap::new();
+    let mut file_rows: HashMap<String, i64> = HashMap::new();
+
     for f in &files {
         let file_id = insert_file(&tx, repo_id, f)?;
+        file_rows.insert(f.rel.clone(), file_id);
+        // Real extent, so a file node reports the span a reader expects rather
+        // than a degenerate L1-L1.
+        let lines = f.text.lines().count().max(1) as i64;
+        tx.execute(
+            "insert into symbols(repo_id, file_id, name, kind, start_line, end_line, signature)
+             values (?1, ?2, ?3, 'file', 1, ?4, ?3)",
+            rusqlite::params![repo_id, file_id, f.rel, lines],
+        )?;
+        let fsym = tx.last_insert_rowid();
+        file_symbol.insert(f.rel.clone(), fsym);
+        n_symbols += 1;
         let ex = match extract::extract(f.lang, &f.text) {
             Ok(e) => e,
             // One unparseable file must not abort indexing the other 125.
@@ -87,13 +105,64 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
             }
             n_symbols += 1;
         }
-        pending.push((ids, ex));
+        pending.push((f.rel.clone(), ids, ex));
+    }
+
+    // Containment: every symbol hangs off its innermost enclosing symbol, or off
+    // its file when it is top level.
+    let mut n_edges = 0usize;
+    for (rel, ids, ex) in &pending {
+        let Some(&fsym) = file_symbol.get(rel) else { continue };
+        for (i, &id) in ids.iter().enumerate() {
+            let parent = match ex.parents.get(i).copied().flatten() {
+                Some(p) => ids.get(p).copied().unwrap_or(fsym),
+                None => fsym,
+            };
+            n_edges += tx.execute(
+                "insert or ignore into edges(repo_id, src_symbol_id, dst_symbol_id, kind)
+                 values (?1, ?2, ?3, 'contains')",
+                rusqlite::params![repo_id, parent, id],
+            )?;
+        }
+    }
+
+    // Imports: file -> file when the specifier resolves inside the repo, else
+    // file -> a module node standing in for the external package.
+    let mut external: HashMap<String, i64> = HashMap::new();
+    for (rel, _, ex) in &pending {
+        let Some(&fsym) = file_symbol.get(rel) else { continue };
+        for spec in &ex.imports {
+            let target = match resolve_import(rel, spec, &file_symbol) {
+                Some(id) => id,
+                None => {
+                    // One node per external package, created on first sight.
+                    if let Some(&id) = external.get(spec) {
+                        id
+                    } else {
+                        let anchor = *file_rows.get(rel).unwrap();
+                        tx.execute(
+                            "insert into symbols(repo_id, file_id, name, kind, start_line, end_line, signature)
+                             values (?1, ?2, ?3, 'module', 0, 0, ?3)",
+                            rusqlite::params![repo_id, anchor, spec],
+                        )?;
+                        let id = tx.last_insert_rowid();
+                        external.insert(spec.clone(), id);
+                        n_symbols += 1;
+                        id
+                    }
+                }
+            };
+            n_edges += tx.execute(
+                "insert or ignore into edges(repo_id, src_symbol_id, dst_symbol_id, kind)
+                 values (?1, ?2, ?3, 'imports')",
+                rusqlite::params![repo_id, fsym, target],
+            )?;
+        }
     }
 
     // Pass 2: resolve call intents against the now-complete repo-wide index.
-    let mut n_edges = 0usize;
     let mut unresolved = 0usize;
-    for (ids, ex) in &pending {
+    for (rel, ids, ex) in &pending {
         // Per-file binding lookup: (scope symbol index or None, variable) -> type.
         let mut binds: HashMap<(Option<usize>, &str), &str> = HashMap::new();
         for b in &ex.bindings {
@@ -101,17 +170,27 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
         }
 
         for c in &ex.calls {
-            let Some(&from_id) = ids.get(c.from) else { continue };
+            // A top-level call is the file's own dependency.
+            let from_id = match c.from {
+                Some(i) => match ids.get(i) {
+                    Some(&id) => id,
+                    None => continue,
+                },
+                None => match file_symbol.get(rel) {
+                    Some(&id) => id,
+                    None => continue,
+                },
+            };
 
             // Receiver-typed resolution first: it names one class's method, where
             // the bare name would match every same-named method in the repo and be
             // dropped as ambiguous.
             if let Some(recv) = &c.receiver {
                 let ty = if recv == "this" {
-                    ex.containers.get(c.from).cloned().flatten()
+                    c.from.and_then(|i| ex.containers.get(i).cloned().flatten())
                 } else if let Some(field) = recv.strip_prefix("this.") {
                     // A field binding is scoped to the class, not the method.
-                    let class = ex.containers.get(c.from).cloned().flatten();
+                    let class = c.from.and_then(|i| ex.containers.get(i).cloned().flatten());
                     class.and_then(|cls| {
                         ex.symbols
                             .iter()
@@ -126,7 +205,7 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
                     // Deeper lexical nesting is not walked — a rarer shape, and
                     // guessing past the first miss risks a wrong edge.
                     binds
-                        .get(&(Some(c.from), recv.as_str()))
+                        .get(&(c.from, recv.as_str()))
                         .or_else(|| binds.get(&(None, recv.as_str())))
                         .copied()
                         .map(str::to_string)
@@ -163,6 +242,45 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
 
     tx.commit().context("commit build")?;
     Ok(BuildStats { files: files.len(), symbols: n_symbols, edges: n_edges, unresolved })
+}
+
+/// Resolve a relative import specifier to a file symbol in the same repo.
+///
+/// ESM TypeScript imports `./stats.js` for what is on disk as `./stats.ts`, so a
+/// literal path lookup finds nothing; the extension has to be re-mapped. Bare
+/// specifiers (`node:fs`, `commander`) are external by definition.
+fn resolve_import(from_rel: &str, spec: &str, files: &HashMap<String, i64>) -> Option<i64> {
+    if !spec.starts_with('.') {
+        return None;
+    }
+    let base = Path::new(from_rel).parent().unwrap_or(Path::new(""));
+    let joined = base.join(spec);
+    // Lexical normalisation: `a/b/../c` -> `a/c`, without touching the disk.
+    let joined = joined.to_string_lossy().into_owned();
+    let mut parts: Vec<&str> = Vec::new();
+    for c in joined.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    let stem = parts.join("/");
+    let base = stem.strip_suffix(".js").unwrap_or(&stem);
+    for cand in [
+        format!("{base}.ts"),
+        format!("{base}.tsx"),
+        stem.clone(),
+        format!("{base}/index.ts"),
+        format!("{base}/index.tsx"),
+    ] {
+        if let Some(&id) = files.get(&cand) {
+            return Some(id);
+        }
+    }
+    None
 }
 
 fn insert_file(tx: &rusqlite::Transaction, repo_id: i64, f: &SourceFile) -> Result<i64> {
@@ -217,7 +335,7 @@ pub fn grep(db: &Connection, repo_id: i64, root: &Path, needle: &str) -> Result<
         "select f.path, s.name, s.kind, s.start_line, s.end_line,
                 (select count(*) from edges e where e.dst_symbol_id = s.id)
            from symbols s join files f on f.id = s.file_id
-          where s.repo_id = ?1",
+          where s.repo_id = ?1 and s.kind not in ('file','module')",
     )?;
     let mut rows = stmt.query([repo_id])?;
     while let Some(r) = rows.next()? {
@@ -374,4 +492,92 @@ mod tests {
         assert_eq!(before, after, "a second build must not double the symbol rows");
         let _ = std::fs::remove_dir_all(&root);
     }
+}
+
+/// One step away from the seed, with the distance that reached it.
+pub struct Reached {
+    pub name: String,
+    pub kind: String,
+    pub path: String,
+    pub start_line: i64,
+    pub end_line: i64,
+    pub edge: String,
+    pub depth: usize,
+}
+
+/// Breadth-first traversal of the edge set from every symbol named `name`.
+///
+/// `Out` follows src->dst (what this calls); the default follows dst->src (what
+/// calls this). Breadth-first and visited-guarded, so a cycle terminates and each
+/// symbol is reported at its shortest distance rather than once per path.
+pub fn callers(
+    db: &Connection,
+    repo_id: i64,
+    name: &str,
+    out: bool,
+    max_depth: usize,
+) -> Result<(Vec<(i64, String, String, String, i64, i64)>, Vec<Reached>)> {
+    let mut seeds_stmt = db.prepare(
+        "select s.id, s.name, s.kind, f.path, s.start_line, s.end_line
+           from symbols s join files f on f.id = s.file_id
+          where s.repo_id = ?1 and s.name = ?2
+          order by f.path, s.start_line",
+    )?;
+    let seeds: Vec<(i64, String, String, String, i64, i64)> = seeds_stmt
+        .query_map(rusqlite::params![repo_id, name], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+        })?
+        .collect::<Result<_, _>>()?;
+
+    let (from_col, to_col) = if out {
+        ("src_symbol_id", "dst_symbol_id")
+    } else {
+        ("dst_symbol_id", "src_symbol_id")
+    };
+    let sql = format!(
+        "select s.id, s.name, s.kind, f.path, s.start_line, s.end_line, e.kind
+           from edges e
+           join symbols s on s.id = e.{to_col}
+           join files f on f.id = s.file_id
+          where e.repo_id = ?1 and e.{from_col} = ?2 and e.kind = 'calls'
+          order by f.path, s.start_line"
+    );
+    let mut step = db.prepare(&sql)?;
+
+    let mut seen: std::collections::HashSet<i64> = seeds.iter().map(|s| s.0).collect();
+    let mut frontier: Vec<i64> = seeds.iter().map(|s| s.0).collect();
+    let mut reached = Vec::new();
+
+    for depth in 1..=max_depth {
+        let mut next = Vec::new();
+        for id in &frontier {
+            let rows = step.query_map(rusqlite::params![repo_id, id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    Reached {
+                        name: r.get(1)?,
+                        kind: r.get(2)?,
+                        path: r.get(3)?,
+                        start_line: r.get(4)?,
+                        end_line: r.get(5)?,
+                        edge: r.get(6)?,
+                        depth,
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (id, hit) = row?;
+                // First arrival wins: BFS means that is the shortest distance.
+                if seen.insert(id) {
+                    next.push(id);
+                    reached.push(hit);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    Ok((seeds, reached))
 }

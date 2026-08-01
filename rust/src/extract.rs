@@ -29,7 +29,9 @@ pub struct Symbol {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallIntent {
     /// Index into the file's symbol list — the symbol the call appears inside.
-    pub from: usize,
+    /// None for a top-level call, which belongs to the file itself: a module-level
+    /// `register(x)` is a real dependency and dropping it loses the edge entirely.
+    pub from: Option<usize>,
     pub callee: String,
     /// Receiver text for a member call (`repo` in `repo.scan()`). None for a bare
     /// call. This is what turns an ambiguous method name into one target.
@@ -50,7 +52,13 @@ pub struct Extracted {
     pub calls: Vec<CallIntent>,
     pub bindings: Vec<Binding>,
     /// Parallel to `symbols`: the enclosing class name for a method, else None.
+    /// Used to resolve a receiver-typed call to one class's method.
     pub containers: Vec<Option<String>>,
+    /// Parallel to `symbols`: index of the innermost enclosing symbol, else None
+    /// for a top-level definition (whose parent is the file). Drives `contains`.
+    pub parents: Vec<Option<usize>>,
+    /// Module specifiers this file imports, verbatim (`./stats.js`, `node:fs`).
+    pub imports: Vec<String>,
 }
 
 /// Definition shapes. `@name` is the identifier stored; the outer capture is the
@@ -81,6 +89,13 @@ const TS_CALLS: &str = r#"
 /// Type bindings. Each alternative names the variable and the type it carries, so
 /// a later member call on that variable resolves to one class's method rather
 /// than to every method in the repo sharing the name.
+/// Import specifiers. `export ... from` is an import too — it pulls the module in
+/// and re-exposes it, so omitting it would lose a real file-to-file dependency.
+const TS_IMPORTS: &str = r#"
+(import_statement source: (string) @spec)
+(export_statement source: (string) @spec)
+"#;
+
 const TS_BINDINGS: &str = r#"
 (variable_declarator
   name: (identifier) @name
@@ -189,6 +204,21 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
             .map(|(i, _)| i)
     };
 
+    // Innermost enclosing symbol of any kind, excluding the symbol itself. This is
+    // what `contains` is built from: class->method, function->nested function, and
+    // (where None) file->top-level definition.
+    let parents: Vec<Option<usize>> = (0..symbols.len())
+        .map(|i| {
+            let (ms, me) = spans[i];
+            spans
+                .iter()
+                .enumerate()
+                .filter(|(j, (s, e))| *j != i && *s <= ms && me <= *e)
+                .min_by_key(|(_, (s, e))| e - s)
+                .map(|(j, _)| j)
+        })
+        .collect();
+
     let containers: Vec<Option<String>> = symbols
         .iter()
         .enumerate()
@@ -215,11 +245,8 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
         else {
             continue;
         };
-        let Some(from) = owner_at(callee_node.start_byte()) else {
-            continue; // top-level call: no caller to attribute it to
-        };
         calls.push(CallIntent {
-            from,
+            from: owner_at(callee_node.start_byte()),
             callee: src[callee_node.byte_range()].to_string(),
             receiver: m
                 .captures
@@ -262,7 +289,22 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
         }
     }
 
-    Ok(Extracted { symbols, calls, bindings, containers })
+    let imp_q = Query::new(&ts_lang, TS_IMPORTS).context("compile import query")?;
+    let mut imports = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut it = cursor.matches(&imp_q, root, src.as_bytes());
+    while let Some(m) = it.next() {
+        for c in m.captures {
+            // The capture is a string literal including its quotes.
+            let raw = &src[c.node.byte_range()];
+            let spec = raw.trim_matches(|ch| ch == '"' || ch == '\'' || ch == '`');
+            if !spec.is_empty() {
+                imports.push(spec.to_string());
+            }
+        }
+    }
+
+    Ok(Extracted { symbols, calls, bindings, containers, parents, imports })
 }
 
 /// Resolve bare callee names against the whole-repo symbol index.
@@ -351,7 +393,7 @@ function helper(): void {}
         let run = e.symbols.iter().position(|s| s.name == "run").unwrap();
         let call = e.calls.iter().find(|c| c.callee == "helper").expect("call not found");
         assert_eq!(
-            call.from, run,
+            call.from, Some(run),
             "the call belongs to run(), not to the enclosing class"
         );
     }
