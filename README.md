@@ -56,15 +56,16 @@
 
 ## Quick start
 
+Install this fork's `dev` branch on any supported platform:
+
 ```bash
 npm install -g 'git+https://github.com/wallentx/Graft.git#dev'
 graft init                       # build the graph + wire it into Claude Code
 ```
 
 On Termux, install the native build toolchain first. Graft's Tree-sitter parsers
-compile from source on Android, so the first install can take a few minutes. Install
-the `dev` branch from this Termux-compatible fork; do not replace it with the
-upstream registry build:
+compile from source on Android, so the first install can take a few minutes. Then
+use the same fork-and-branch install command shown above:
 
 ```bash
 pkg install git nodejs python make clang

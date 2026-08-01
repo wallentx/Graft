@@ -1,3 +1,5 @@
+/// <reference types="tree-sitter-runtime" />
+
 /**
  * Receiver-type binding pass: a pre-order walk over a parsed file that answers,
  * for every local variable / parameter / class field / `self`|`this` attribute,

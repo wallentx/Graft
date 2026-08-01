@@ -74,19 +74,24 @@ test('runInit appends the allowlist to a pre-existing permissions block, preserv
 
 test('postinstall prints the installed-binary nudge in a fresh dir', () => {
   const d = fresh();
-  const out = runPostinstall({ INIT_CWD: d, CI: '' });
+  const out = runPostinstall({ INIT_CWD: d, CI: '', npm_config_global: 'true' });
   assert.match(out, /graft init/);
+});
+
+test('postinstall is silent for a project-local dependency install', () => {
+  const out = runPostinstall({ INIT_CWD: fresh(), CI: '', npm_config_global: 'false' });
+  assert.equal(out.trim(), '');
 });
 
 test('postinstall is silent when already initialized', () => {
   const d = fresh();
   runInit(d, { build: false });
-  const out = runPostinstall({ INIT_CWD: d, CI: '' });
+  const out = runPostinstall({ INIT_CWD: d, CI: '', npm_config_global: 'true' });
   assert.equal(out.trim(), '');
 });
 
 test('postinstall is silent under CI', () => {
-  const out = runPostinstall({ INIT_CWD: fresh(), CI: '1' });
+  const out = runPostinstall({ INIT_CWD: fresh(), CI: '1', npm_config_global: 'true' });
   assert.equal(out.trim(), '');
 });
 

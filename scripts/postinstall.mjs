@@ -1,6 +1,7 @@
 // Prints a one-line nudge after install. Never fails the install.
 try {
   if (process.env.CI) process.exit(0);
+  if (process.env.npm_config_global?.toLowerCase() !== 'true') process.exit(0);
   const { existsSync } = await import('node:fs');
   const { join } = await import('node:path');
   const dir = process.env.INIT_CWD || process.cwd();
