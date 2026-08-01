@@ -8,6 +8,11 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { buildGraphIfMissing, runInit } from '../src/claude/init.js';
 import { formatInitEpilogue } from '../src/cli-epilogue.js';
 
+// Pin the MCP launch form so these expectations don't depend on whether the
+// machine running the tests has a working `graft` on PATH. The probe itself, and
+// the warning runInit emits on the fallback, are covered separately.
+process.env.GRAFT_MCP_LAUNCH = 'bin';
+
 function fresh(): string { return mkdtempSync(join(tmpdir(), 'graft-init-')); }
 
 function runPostinstall(env: Record<string, string>): string {
@@ -159,4 +164,28 @@ test('buildGraphIfMissing: an existing graph is left alone', () => {
   writeFileSync(join(dir, 'graft', '.graph', 'wiring.json'), '{}');
   // A bogus cliPath would throw if it were reached; the wiring check short-circuits.
   assert.equal(buildGraphIfMissing(dir, { build: true, cliPath: '/nonexistent/cli.js' }), false);
+});
+
+// --- MCP launch fallback ---------------------------------------------------
+
+test('runInit warns when .mcp.json gets a machine-specific absolute launch', () => {
+  // .mcp.json is a committed file. When the bare `graft` command cannot execute
+  // (Termux: no /usr/bin/env for the shebang) init still produces a working
+  // config, but it must say the path is local-only rather than write it silently.
+  const prev = process.env.GRAFT_MCP_LAUNCH;
+  process.env.GRAFT_MCP_LAUNCH = 'node';
+  try {
+    const dir = fresh();
+    const res = runInit(dir, { build: false });
+    const cfg = JSON.parse(readFileSync(join(dir, '.mcp.json'), 'utf8'));
+    assert.equal(cfg.mcpServers.graft.command, process.execPath, 'absolute node launch written');
+    assert.equal(cfg.mcpServers.graft.args.at(-1), 'mcp');
+    assert.equal(
+      res.warnings.filter((w) => /machine-specific/.test(w)).length, 1,
+      `expected exactly one machine-specific warning, got ${JSON.stringify(res.warnings)}`,
+    );
+  } finally {
+    if (prev === undefined) delete process.env.GRAFT_MCP_LAUNCH;
+    else process.env.GRAFT_MCP_LAUNCH = prev;
+  }
 });

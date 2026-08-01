@@ -78,7 +78,19 @@ export function runInit(dir: string, opts: { build?: boolean; cliPath?: string }
   // Register the graft MCP server in the project's .mcp.json so Claude Code
   // exposes graft_find_code/graft_trace_calls/etc. as tools — the same keyed merge the
   // other hosts use (existing servers preserved; unparseable files skipped).
-  const mcp = mergeJsonKey('claude', mcpTarget, 'mcpServers', serverEntry());
+  const entry = serverEntry();
+  if (entry.command !== 'graft') {
+    // The bare command did not execute (no `graft` on PATH, or a shebang that
+    // cannot resolve its interpreter — the usual case on Termux). We fell back to
+    // an absolute `node <cli.js>`, which works here but names only this machine.
+    // Say so: .mcp.json is a committed file, and a teammate cloning it would get
+    // a path that does not exist for them.
+    warnings.push(
+      `MCP server registered as an absolute path (${entry.command}) — a bare \`graft\` did not execute. ` +
+      'This works locally but is machine-specific; put graft on PATH and re-run init before committing .mcp.json.',
+    );
+  }
+  const mcp = mergeJsonKey('claude', mcpTarget, 'mcpServers', entry);
 
   const built = buildGraphIfMissing(dir, opts);
   return { settingsPath, shims: [sl, hk], skill: skillPath, mcp, warnings, built };

@@ -7,6 +7,11 @@ import { join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { runHostsInit } from '../src/hosts/init.js';
 
+// Pin the MCP launch form so these expectations don't depend on whether the
+// machine running the tests has a working `graft` on PATH. The probe itself is
+// covered directly in hosts-mcp-config.test.ts.
+process.env.GRAFT_MCP_LAUNCH = 'bin';
+
 function fresh(): string { return mkdtempSync(join(tmpdir(), 'graft-hostsinit-')); }
 
 test('writes only detected hosts by default', () => {
