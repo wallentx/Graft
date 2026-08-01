@@ -61,6 +61,14 @@ npm install -g @nanonets/graft   # install the CLI, once
 graft init                       # build the graph + wire it into Claude Code
 ```
 
+On Termux, install the native build toolchain first. Graft's Tree-sitter parsers
+compile from source on Android, so the first install can take a few minutes:
+
+```bash
+pkg install nodejs python make clang
+npm install -g @nanonets/graft
+```
+
 That is the whole setup. `graft init` asks which of your coding agents to wire up, builds `graft/` from your code, and drops a statusline and hooks into `.claude/`, so from the next session on Graft rides along in Claude Code: it pulls the matching nodes into each prompt and rebuilds the graph in the background after every turn. No daemon, no re-indexing to remember, nothing to run or maintain by default — the graph is just files.
 
 Nothing is written until you pick. Run `graft init --dry-run` to see every file it would touch first, or `graft init --agents claude` to skip the prompt and wire Claude Code alone.
