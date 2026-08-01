@@ -129,7 +129,11 @@ fn main() -> Result<()> {
                 "{pattern:?} — {} hits in {} symbols across {} files (searched {} indexed files)",
                 r.total_hits,
                 r.groups.len(),
-                r.groups.iter().map(|g| &g.path).collect::<std::collections::HashSet<_>>().len(),
+                r.groups
+                    .iter()
+                    .map(|g| &g.path)
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
                 r.files_searched
             );
             for g in &r.groups {
@@ -149,22 +153,34 @@ fn main() -> Result<()> {
             }
         }
 
-        Cmd::Callers { symbol, direction, depth, path } => {
+        Cmd::Callers {
+            symbol,
+            direction,
+            depth,
+            path,
+        } => {
             let root = repo::root_of(&path)?;
             let conn = db::open(&store)?;
             let Some(repo_id) = index::repo_id_of(&conn, &root)? else {
                 eprintln!("{}", not_indexed(&root));
                 std::process::exit(2);
             };
-            let max = if depth == "all" { usize::MAX } else { depth.parse().unwrap_or(1) };
+            let max = if depth == "all" {
+                usize::MAX
+            } else {
+                depth.parse().unwrap_or(1)
+            };
             let out = direction == "out";
             let (seeds, reached) = index::callers(&conn, repo_id, &symbol, out, max)?;
             if seeds.is_empty() {
                 eprintln!("no symbol named {symbol:?} — check the spelling, or run `graft build`");
                 std::process::exit(2);
             }
-            for (_, name, kind, p, s0, s1) in &seeds {
-                println!("{name} · {kind} · {p}:L{s0}-L{s1}");
+            for seed in &seeds {
+                println!(
+                    "{} · {} · {}:L{}-L{}",
+                    seed.name, seed.kind, seed.path, seed.start_line, seed.end_line
+                );
             }
             if reached.is_empty() {
                 println!("  (no {} edges)", if out { "outgoing" } else { "incoming" });
@@ -172,8 +188,8 @@ fn main() -> Result<()> {
             for r in &reached {
                 let arrow = if out { "→" } else { "←" };
                 println!(
-                    "  {} {} {} ({}:L{}-L{}) [depth {}]",
-                    r.edge, arrow, r.name, r.path, r.start_line, r.end_line, r.depth
+                    "  {} {} {} · {} ({}:L{}-L{}) [depth {}]",
+                    r.edge, arrow, r.name, r.kind, r.path, r.start_line, r.end_line, r.depth
                 );
             }
         }
@@ -187,16 +203,29 @@ fn main() -> Result<()> {
             };
             // Accept either a repo-relative path or one the shell completed.
             let abs = std::fs::canonicalize(&file).unwrap_or_else(|_| root.join(&file));
-            let rel = abs.strip_prefix(&root).unwrap_or(&file).to_string_lossy().replace('\\', "/");
+            let rel = abs
+                .strip_prefix(&root)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .replace('\\', "/");
             let rows = index::skeleton(&conn, repo_id, &rel)?;
             if rows.is_empty() {
-                eprintln!("no indexed symbols in {rel} — is it indexed, and a language graft reads?");
+                eprintln!(
+                    "no indexed symbols in {rel} — is it indexed, and a language graft reads?"
+                );
                 std::process::exit(2);
             }
             println!("graft skeleton — {rel}");
             for r in &rows {
-                let owner = r.container.as_deref().map(|c| format!("{c}.")).unwrap_or_default();
-                println!("- L{}-L{}  {} {}{}  {}", r.start_line, r.end_line, r.kind, owner, r.name, r.signature);
+                let owner = r
+                    .container
+                    .as_deref()
+                    .map(|c| format!("{c}."))
+                    .unwrap_or_default();
+                println!(
+                    "- L{}-L{}  {} {}{}  {}",
+                    r.start_line, r.end_line, r.kind, owner, r.name, r.signature
+                );
             }
         }
 
@@ -208,7 +237,10 @@ fn main() -> Result<()> {
                 std::process::exit(2);
             };
             let m = index::repo_map(&conn, repo_id, 12)?;
-            println!("repo map — {} files · {} symbols · {} edges", m.files, m.symbols, m.edges);
+            println!(
+                "repo map — {} files · {} symbols · {} edges",
+                m.files, m.symbols, m.edges
+            );
             println!();
             for d in &m.dirs {
                 let hubs = d
@@ -220,14 +252,24 @@ fn main() -> Result<()> {
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                let tail = if hubs.is_empty() { String::new() } else { format!("   hubs: {hubs}") };
-                println!("{:<18}{} files · {} symbols{}", d.dir, d.files, d.symbols, tail);
+                let tail = if hubs.is_empty() {
+                    String::new()
+                } else {
+                    format!("   hubs: {hubs}")
+                };
+                println!(
+                    "{:<18}{} files · {} symbols{}",
+                    d.dir, d.files, d.symbols, tail
+                );
             }
             if !m.hotspots.is_empty() {
                 println!();
                 print!("hotspots:");
                 for h in &m.hotspots {
-                    print!("  {} · {} · {}:L{}-L{} · {}←", h.name, h.kind, h.path, h.start_line, h.end_line, h.in_degree);
+                    print!(
+                        "  {} · {} · {}:L{}-L{} · {}←",
+                        h.name, h.kind, h.path, h.start_line, h.end_line, h.in_degree
+                    );
                 }
                 println!();
             }
@@ -249,10 +291,11 @@ fn main() -> Result<()> {
                         [id],
                         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                     )?;
-                    let stamp: String =
-                        conn.query_row("select extractor_stamp from repos where id=?1", [id], |r| {
-                            r.get(0)
-                        })?;
+                    let stamp: String = conn.query_row(
+                        "select extractor_stamp from repos where id=?1",
+                        [id],
+                        |r| r.get(0),
+                    )?;
                     println!("{}", root.display());
                     println!("  files    {files}");
                     println!("  symbols  {syms}");

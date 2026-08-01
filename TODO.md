@@ -3,7 +3,7 @@
 Working notes for the fork. Numbers are measured against this repo unless stated
 otherwise; the TypeScript build is the reference implementation being ported.
 
-Status as of the last commit on `wallentx/rust`: 20 tests green, schema v3,
+Status on `wallentx/rust`: 28 tests green, schema v3,
 `build` / `grep` / `callers` / `skeleton` / `map` / `status` implemented for
 TypeScript, Python and Go.
 

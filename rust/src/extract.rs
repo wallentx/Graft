@@ -146,7 +146,7 @@ const PY_BINDINGS: &str = r#"
 
 const PY_IMPORTS: &str = r#"
 (import_statement name: (dotted_name) @spec)
-(import_from_statement module_name: (dotted_name) @spec)
+(import_from_statement module_name: [(dotted_name) (relative_import)] @spec)
 "#;
 
 /// Go has no lexical nesting for methods, so a method's container cannot be found
@@ -157,6 +157,7 @@ const GO_DEFS: &str = r#"
 (function_declaration name: (identifier) @name) @def
 (method_declaration
   receiver: (parameter_list (parameter_declaration
+    name: (identifier)? @recvname
     type: [(pointer_type (type_identifier) @recvty) (type_identifier) @recvty]))
   name: (field_identifier) @name) @def
 (type_declaration (type_spec name: (type_identifier) @name)) @def
@@ -237,7 +238,11 @@ fn signature_of(src: &str, n: &Node) -> String {
     let line = line.strip_suffix('{').unwrap_or(line).trim_end();
     let mut s = line.to_string();
     if s.len() > 200 {
-        s.truncate(200);
+        let mut end = 200;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
         s.push('…');
     }
     s
@@ -260,8 +265,11 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
         .context("query lacks @def")?;
 
     let recvty_idx = def_q.capture_index_for_name("recvty");
-    // Parallel to `symbols`: a Go method's receiver type, filled during the walk.
+    let recvname_idx = def_q.capture_index_for_name("recvname");
+    // Parallel to `symbols`: a Go method's receiver type and variable, filled
+    // during the definition pass.
     let mut recv_types: Vec<Option<String>> = Vec::new();
+    let mut recv_names: Vec<Option<String>> = Vec::new();
     let mut symbols: Vec<Symbol> = Vec::new();
     // Byte span of each symbol, kept parallel to `symbols`, so a call site can be
     // attributed to the innermost definition containing it.
@@ -270,8 +278,16 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
     let mut cursor = QueryCursor::new();
     let mut it = cursor.matches(&def_q, root, src.as_bytes());
     while let Some(m) = it.next() {
-        let name_node = m.captures.iter().find(|c| c.index == name_idx).map(|c| c.node);
-        let def_node = m.captures.iter().find(|c| c.index == def_idx).map(|c| c.node);
+        let name_node = m
+            .captures
+            .iter()
+            .find(|c| c.index == name_idx)
+            .map(|c| c.node);
+        let def_node = m
+            .captures
+            .iter()
+            .find(|c| c.index == def_idx)
+            .map(|c| c.node);
         let (Some(name_node), Some(def_node)) = (name_node, def_node) else {
             continue;
         };
@@ -286,6 +302,11 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
         spans.push((def_node.start_byte(), def_node.end_byte()));
         recv_types.push(
             recvty_idx
+                .and_then(|i| m.captures.iter().find(|c| c.index == i))
+                .map(|c| src[c.node.byte_range()].to_string()),
+        );
+        recv_names.push(
+            recvname_idx
                 .and_then(|i| m.captures.iter().find(|c| c.index == i))
                 .map(|c| src[c.node.byte_range()].to_string()),
         );
@@ -320,12 +341,11 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
     // class is reclassified here. Without it Python methods carry no container and
     // no member call against them can ever resolve.
     for i in 0..symbols.len() {
-        if symbols[i].kind == "function" {
-            if let Some(p) = parents[i] {
-                if symbols[p].kind == "class" {
-                    symbols[i].kind = "method".to_string();
-                }
-            }
+        if symbols[i].kind == "function"
+            && let Some(p) = parents[i]
+            && symbols[p].kind == "class"
+        {
+            symbols[i].kind = "method".to_string();
         }
     }
 
@@ -355,15 +375,23 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
         .collect();
 
     let call_q = Query::new(&ts_lang, q.calls).context("compile call query")?;
-    let callee_idx = call_q.capture_index_for_name("callee").context("query lacks @callee")?;
-    let recv_idx = call_q.capture_index_for_name("recv").context("query lacks @recv")?;
+    let callee_idx = call_q
+        .capture_index_for_name("callee")
+        .context("query lacks @callee")?;
+    let recv_idx = call_q
+        .capture_index_for_name("recv")
+        .context("query lacks @recv")?;
     let mut calls = Vec::new();
     let mut cursor = QueryCursor::new();
     let mut it = cursor.matches(&call_q, root, src.as_bytes());
     while let Some(m) = it.next() {
         // Per match, not per capture: a member call matches @recv and @callee
         // together, and iterating captures would record the call twice.
-        let Some(callee_node) = m.captures.iter().find(|c| c.index == callee_idx).map(|c| c.node)
+        let Some(callee_node) = m
+            .captures
+            .iter()
+            .find(|c| c.index == callee_idx)
+            .map(|c| c.node)
         else {
             continue;
         };
@@ -382,8 +410,19 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
     let b_name = bind_q.capture_index_for_name("name");
     let b_field = bind_q.capture_index_for_name("field");
     let _ = &b_field;
-    let b_ty = bind_q.capture_index_for_name("ty").context("query lacks @ty")?;
+    let b_ty = bind_q
+        .capture_index_for_name("ty")
+        .context("query lacks @ty")?;
     let mut bindings = Vec::new();
+    for (owner, (name, ty)) in recv_names.iter().zip(&recv_types).enumerate() {
+        if let (Some(name), Some(ty)) = (name, ty) {
+            bindings.push(Binding {
+                owner: Some(owner),
+                name: name.clone(),
+                ty: ty.clone(),
+            });
+        }
+    }
     let mut cursor = QueryCursor::new();
     let mut it = cursor.matches(&bind_q, root, src.as_bytes());
     while let Some(m) = it.next() {
@@ -427,7 +466,14 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
         }
     }
 
-    Ok(Extracted { symbols, calls, bindings, containers, parents, imports })
+    Ok(Extracted {
+        symbols,
+        calls,
+        bindings,
+        containers,
+        parents,
+        imports,
+    })
 }
 
 /// Resolve bare callee names against the whole-repo symbol index.
@@ -435,11 +481,7 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
 /// Ambiguity is dropped, not guessed: a name defined in more than one file cannot
 /// be attributed to one of them from a bare call site, and inventing an edge is
 /// worse than omitting one — `callers` is used to decide what a change breaks.
-pub fn resolve(
-    by_name: &HashMap<String, Vec<i64>>,
-    from_id: i64,
-    callee: &str,
-) -> Option<i64> {
+pub fn resolve(by_name: &HashMap<String, Vec<i64>>, from_id: i64, callee: &str) -> Option<i64> {
     match by_name.get(callee)?.as_slice() {
         [only] => Some(*only),
         // Self-recursion resolves even when the name is ambiguous repo-wide.
@@ -501,7 +543,18 @@ enum Color { Red }
     #[test]
     fn lines_are_one_based() {
         let e = extract(Lang::TypeScript, "\n\nfunction f() {}\n").unwrap();
-        assert_eq!(e.symbols[0].start_line, 3, "tree-sitter rows are 0-based; storage is 1-based");
+        assert_eq!(
+            e.symbols[0].start_line, 3,
+            "tree-sitter rows are 0-based; storage is 1-based"
+        );
+    }
+
+    #[test]
+    fn long_unicode_signatures_truncate_on_a_char_boundary() {
+        let src = format!("function f(/*{}é*/) {{}}", "a".repeat(186));
+        let e = extract(Lang::TypeScript, &src).unwrap();
+        assert!(e.symbols[0].signature.ends_with('…'));
+        assert!(e.symbols[0].signature.len() <= 203);
     }
 
     #[test]
@@ -514,9 +567,14 @@ function helper(): void {}
 "#;
         let e = extract(Lang::TypeScript, src).unwrap();
         let run = e.symbols.iter().position(|s| s.name == "run").unwrap();
-        let call = e.calls.iter().find(|c| c.callee == "helper").expect("call not found");
+        let call = e
+            .calls
+            .iter()
+            .find(|c| c.callee == "helper")
+            .expect("call not found");
         assert_eq!(
-            call.from, Some(run),
+            call.from,
+            Some(run),
             "the call belongs to run(), not to the enclosing class"
         );
     }
@@ -533,7 +591,11 @@ function helper(): void {}
         idx.insert("unique".to_string(), vec![7]);
         idx.insert("dup".to_string(), vec![1, 2]);
         assert_eq!(resolve(&idx, 99, "unique"), Some(7));
-        assert_eq!(resolve(&idx, 99, "dup"), None, "an invented edge is worse than a missing one");
+        assert_eq!(
+            resolve(&idx, 99, "dup"),
+            None,
+            "an invented edge is worse than a missing one"
+        );
         assert_eq!(resolve(&idx, 99, "absent"), None);
         // …except recursion, where the caller is itself a candidate.
         assert_eq!(resolve(&idx, 2, "dup"), Some(2));
@@ -567,9 +629,16 @@ def main():
     helper()
 "#;
         let e = extract(Lang::Python, src).unwrap();
-        let names: Vec<_> = e.symbols.iter().map(|s| (s.name.as_str(), s.kind.as_str())).collect();
+        let names: Vec<_> = e
+            .symbols
+            .iter()
+            .map(|s| (s.name.as_str(), s.kind.as_str()))
+            .collect();
         assert!(names.contains(&("Repo", "class")), "{names:?}");
-        assert!(names.contains(&("scan", "method")), "a def inside a class is a method: {names:?}");
+        assert!(
+            names.contains(&("scan", "method")),
+            "a def inside a class is a method: {names:?}"
+        );
         assert_eq!(
             e.containers[e.symbols.iter().position(|s| s.name == "scan").unwrap()].as_deref(),
             Some("Repo"),
@@ -581,10 +650,19 @@ def main():
         // resolve to Repo.scan rather than to every method named scan.
         assert!(
             e.bindings.iter().any(|b| b.name == "r" && b.ty == "Repo"),
-            "{:?}", e.bindings
+            "{:?}",
+            e.bindings
         );
-        assert!(e.calls.iter().any(|c| c.callee == "scan" && c.receiver.as_deref() == Some("r")));
-        assert!(e.calls.iter().any(|c| c.callee == "helper" && c.receiver.is_none()));
+        assert!(
+            e.calls
+                .iter()
+                .any(|c| c.callee == "scan" && c.receiver.as_deref() == Some("r"))
+        );
+        assert!(
+            e.calls
+                .iter()
+                .any(|c| c.callee == "helper" && c.receiver.is_none())
+        );
         assert!(e.imports.iter().any(|i| i == "os"), "{:?}", e.imports);
         assert!(e.imports.iter().any(|i| i == "pkg.mod"), "{:?}", e.imports);
     }
@@ -598,6 +676,12 @@ def main():
     }
 
     #[test]
+    fn python_preserves_relative_import_prefixes() {
+        let e = extract(Lang::Python, "from ..pkg.mod import helper\n").unwrap();
+        assert_eq!(e.imports, ["..pkg.mod"]);
+    }
+
+    #[test]
     fn python_binds_self_fields_from_constructor_assignment() {
         // `self.store.fetch()` only resolves if `self.store = Store()` is recorded
         // as a field binding scoped to the class.
@@ -607,8 +691,11 @@ def main():
         )
         .unwrap();
         assert!(
-            e.bindings.iter().any(|b| b.name.ends_with("store") && b.ty == "Store"),
-            "{:?}", e.bindings
+            e.bindings
+                .iter()
+                .any(|b| b.name.ends_with("store") && b.ty == "Store"),
+            "{:?}",
+            e.bindings
         );
     }
 
@@ -625,22 +712,45 @@ func (w *Worker) Run() {
 	fmt.Println(w.n)
 }
 
+func (*Worker) Idle() {}
+
 func main() {
 	var w Worker
 	w.Run()
 }
 "#;
         let e = extract(Lang::Go, src).unwrap();
-        let names: Vec<_> = e.symbols.iter().map(|s| (s.name.as_str(), s.kind.as_str())).collect();
+        let names: Vec<_> = e
+            .symbols
+            .iter()
+            .map(|s| (s.name.as_str(), s.kind.as_str()))
+            .collect();
         assert!(names.contains(&("Worker", "type")), "{names:?}");
         assert!(names.contains(&("Run", "method")), "{names:?}");
+        assert!(
+            names.contains(&("Idle", "method")),
+            "anonymous receivers still define methods: {names:?}"
+        );
         assert!(names.contains(&("main", "function")), "{names:?}");
 
         assert!(
             e.bindings.iter().any(|b| b.name == "w" && b.ty == "Worker"),
-            "`var w Worker` must bind: {:?}", e.bindings
+            "`var w Worker` must bind: {:?}",
+            e.bindings
         );
-        assert!(e.calls.iter().any(|c| c.callee == "Run" && c.receiver.as_deref() == Some("w")));
+        let run = e.symbols.iter().position(|s| s.name == "Run").unwrap();
+        assert!(
+            e.bindings
+                .iter()
+                .any(|b| b.owner == Some(run) && b.name == "w" && b.ty == "Worker"),
+            "method receiver must bind inside its method: {:?}",
+            e.bindings
+        );
+        assert!(
+            e.calls
+                .iter()
+                .any(|c| c.callee == "Run" && c.receiver.as_deref() == Some("w"))
+        );
         assert!(e.imports.iter().any(|i| i == "fmt"), "{:?}", e.imports);
         // Go methods are not lexically nested, so the container comes from the
         // receiver — with the pointer unwrapped.

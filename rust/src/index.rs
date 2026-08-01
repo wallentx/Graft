@@ -3,15 +3,15 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::extract;
-use crate::repo::{self, SourceFile};
+use crate::repo::{self, Lang, SourceFile};
 
 /// Identifies the extractor. Any change to the queries or the stored shape must
 /// bump this, because it is what tells an existing store its rows were produced
 /// by a different extractor and cannot be trusted.
-pub const EXTRACTOR_STAMP: &str = "rs-ts-1";
+pub const EXTRACTOR_STAMP: &str = "rs-multilang-2";
 
 pub struct BuildStats {
     pub files: usize,
@@ -58,7 +58,7 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
 
     // Pass 1: symbols. Call targets cannot be resolved until every file's symbols
     // exist, because a callee is usually defined somewhere else.
-    let mut pending: Vec<(String, Vec<i64>, extract::Extracted)> = Vec::new();
+    let mut pending: Vec<(String, Lang, Vec<i64>, extract::Extracted)> = Vec::new();
     let mut by_name: HashMap<String, Vec<i64>> = HashMap::new();
     // (class, method) -> ids. What a receiver-typed call resolves against.
     let mut by_container: HashMap<(String, String), Vec<i64>> = HashMap::new();
@@ -84,11 +84,7 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
         let fsym = tx.last_insert_rowid();
         file_symbol.insert(f.rel.clone(), fsym);
         n_symbols += 1;
-        let ex = match extract::extract(f.lang, &f.text) {
-            Ok(e) => e,
-            // One unparseable file must not abort indexing the other 125.
-            Err(_) => continue,
-        };
+        let ex = extract::extract(f.lang, &f.text).with_context(|| format!("extract {}", f.rel))?;
         let mut ids = Vec::with_capacity(ex.symbols.len());
         for (i, s) in ex.symbols.iter().enumerate() {
             let container = ex.containers.get(i).cloned().flatten();
@@ -101,18 +97,23 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
             ids.push(id);
             by_name.entry(s.name.clone()).or_default().push(id);
             if let Some(c) = container {
-                by_container.entry((c, s.name.clone())).or_default().push(id);
+                by_container
+                    .entry((c, s.name.clone()))
+                    .or_default()
+                    .push(id);
             }
             n_symbols += 1;
         }
-        pending.push((f.rel.clone(), ids, ex));
+        pending.push((f.rel.clone(), f.lang, ids, ex));
     }
 
     // Containment: every symbol hangs off its innermost enclosing symbol, or off
     // its file when it is top level.
     let mut n_edges = 0usize;
-    for (rel, ids, ex) in &pending {
-        let Some(&fsym) = file_symbol.get(rel) else { continue };
+    for (rel, _, ids, ex) in &pending {
+        let Some(&fsym) = file_symbol.get(rel) else {
+            continue;
+        };
         for (i, &id) in ids.iter().enumerate() {
             let parent = match ex.parents.get(i).copied().flatten() {
                 Some(p) => ids.get(p).copied().unwrap_or(fsym),
@@ -129,12 +130,15 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
     // Imports: file -> file when the specifier resolves inside the repo, else
     // file -> a module node standing in for the external package.
     let mut external: HashMap<String, i64> = HashMap::new();
-    for (rel, _, ex) in &pending {
-        let Some(&fsym) = file_symbol.get(rel) else { continue };
+    let go_module = go_module_path(root);
+    for (rel, lang, _, ex) in &pending {
+        let Some(&fsym) = file_symbol.get(rel) else {
+            continue;
+        };
         for spec in &ex.imports {
-            let target = match resolve_import(rel, spec, &file_symbol) {
-                Some(id) => id,
-                None => {
+            let mut targets = resolve_import(rel, *lang, spec, go_module.as_deref(), &file_symbol);
+            if targets.is_empty() {
+                targets.push(
                     // One node per external package, created on first sight.
                     if let Some(&id) = external.get(spec) {
                         id
@@ -149,20 +153,22 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
                         external.insert(spec.clone(), id);
                         n_symbols += 1;
                         id
-                    }
-                }
-            };
-            n_edges += tx.execute(
-                "insert or ignore into edges(repo_id, src_symbol_id, dst_symbol_id, kind)
-                 values (?1, ?2, ?3, 'imports')",
-                rusqlite::params![repo_id, fsym, target],
-            )?;
+                    },
+                );
+            }
+            for target in targets {
+                n_edges += tx.execute(
+                    "insert or ignore into edges(repo_id, src_symbol_id, dst_symbol_id, kind)
+                     values (?1, ?2, ?3, 'imports')",
+                    rusqlite::params![repo_id, fsym, target],
+                )?;
+            }
         }
     }
 
     // Pass 2: resolve call intents against the now-complete repo-wide index.
     let mut unresolved = 0usize;
-    for (rel, ids, ex) in &pending {
+    for (rel, _, ids, ex) in &pending {
         // Per-file binding lookup: (scope symbol index or None, variable) -> type.
         let mut binds: HashMap<(Option<usize>, &str), &str> = HashMap::new();
         for b in &ex.bindings {
@@ -190,7 +196,10 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
                 // does in TypeScript: they name the enclosing type.
                 let ty = if recv == "this" || recv == "self" {
                     c.from.and_then(|i| ex.containers.get(i).cloned().flatten())
-                } else if let Some(field) = recv.strip_prefix("this.").or_else(|| recv.strip_prefix("self.")) {
+                } else if let Some(field) = recv
+                    .strip_prefix("this.")
+                    .or_else(|| recv.strip_prefix("self."))
+                {
                     // A field binding is scoped to the class, not the method.
                     let class = c.from.and_then(|i| ex.containers.get(i).cloned().flatten());
                     class.and_then(|cls| {
@@ -217,15 +226,17 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
                         .copied()
                         .map(str::to_string)
                 };
-                if let Some(ty) = ty {
-                    if let Some([only]) = by_container.get(&(ty, c.callee.clone())).map(|v| v.as_slice()) {
-                        n_edges += tx.execute(
-                            "insert or ignore into edges(repo_id, src_symbol_id, dst_symbol_id, kind)
-                             values (?1, ?2, ?3, 'calls')",
-                            rusqlite::params![repo_id, from_id, *only],
-                        )?;
-                        continue;
-                    }
+                if let Some(ty) = ty
+                    && let Some([only]) = by_container
+                        .get(&(ty, c.callee.clone()))
+                        .map(|v| v.as_slice())
+                {
+                    n_edges += tx.execute(
+                        "insert or ignore into edges(repo_id, src_symbol_id, dst_symbol_id, kind)
+                         values (?1, ?2, ?3, 'calls')",
+                        rusqlite::params![repo_id, from_id, *only],
+                    )?;
+                    continue;
                 }
             }
 
@@ -257,22 +268,18 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
     }
 
     tx.commit().context("commit build")?;
-    Ok(BuildStats { files: files.len(), symbols: n_symbols, edges: n_edges, unresolved })
+    Ok(BuildStats {
+        files: files.len(),
+        symbols: n_symbols,
+        edges: n_edges,
+        unresolved,
+    })
 }
 
-/// Resolve a relative import specifier to a file symbol in the same repo.
-///
-/// ESM TypeScript imports `./stats.js` for what is on disk as `./stats.ts`, so a
-/// literal path lookup finds nothing; the extension has to be re-mapped. Bare
-/// specifiers (`node:fs`, `commander`) are external by definition.
-fn resolve_import(from_rel: &str, spec: &str, files: &HashMap<String, i64>) -> Option<i64> {
-    if !spec.starts_with('.') {
-        return None;
-    }
-    let base = Path::new(from_rel).parent().unwrap_or(Path::new(""));
-    let joined = base.join(spec);
+/// Lexically normalize a repo-relative path without consulting the filesystem.
+fn normalize_path(path: &Path) -> String {
+    let joined = path.to_string_lossy();
     // Lexical normalisation: `a/b/../c` -> `a/c`, without touching the disk.
-    let joined = joined.to_string_lossy().into_owned();
     let mut parts: Vec<&str> = Vec::new();
     for c in joined.split('/') {
         match c {
@@ -283,20 +290,91 @@ fn resolve_import(from_rel: &str, spec: &str, files: &HashMap<String, i64>) -> O
             other => parts.push(other),
         }
     }
-    let stem = parts.join("/");
-    let base = stem.strip_suffix(".js").unwrap_or(&stem);
-    for cand in [
-        format!("{base}.ts"),
-        format!("{base}.tsx"),
-        stem.clone(),
-        format!("{base}/index.ts"),
-        format!("{base}/index.tsx"),
-    ] {
-        if let Some(&id) = files.get(&cand) {
-            return Some(id);
+    parts.join("/")
+}
+
+/// Resolve one language's import to file nodes in the same repo.
+///
+/// Go packages may contain multiple files, so this returns every file node in the
+/// package. TypeScript and Python module paths resolve to at most one file.
+fn resolve_import(
+    from_rel: &str,
+    lang: Lang,
+    spec: &str,
+    go_module: Option<&str>,
+    files: &HashMap<String, i64>,
+) -> Vec<i64> {
+    let from_dir = Path::new(from_rel).parent().unwrap_or(Path::new(""));
+    let candidates = match lang {
+        Lang::TypeScript | Lang::Tsx => {
+            if !spec.starts_with('.') {
+                return Vec::new();
+            }
+            let stem = normalize_path(&from_dir.join(spec));
+            let base = stem.strip_suffix(".js").unwrap_or(&stem);
+            vec![
+                format!("{base}.ts"),
+                format!("{base}.tsx"),
+                stem.clone(),
+                format!("{base}/index.ts"),
+                format!("{base}/index.tsx"),
+            ]
+        }
+        Lang::Python => {
+            let dots = spec.bytes().take_while(|b| *b == b'.').count();
+            let module = spec[dots..].replace('.', "/");
+            let mut base = from_dir.to_path_buf();
+            if dots == 0 {
+                base = Path::new("").to_path_buf();
+            } else {
+                for _ in 1..dots {
+                    base.pop();
+                }
+            }
+            let stem = normalize_path(&base.join(module));
+            vec![format!("{stem}.py"), format!("{stem}/__init__.py")]
+        }
+        Lang::Go => {
+            let Some(module) = go_module else {
+                return Vec::new();
+            };
+            let package = if spec == module {
+                ""
+            } else if let Some(rest) = spec.strip_prefix(module).and_then(|s| s.strip_prefix('/')) {
+                rest
+            } else {
+                return Vec::new();
+            };
+            let mut ids: Vec<i64> = files
+                .iter()
+                .filter(|(path, _)| {
+                    path.ends_with(".go")
+                        && Path::new(path.as_str()).parent().unwrap_or(Path::new(""))
+                            == Path::new(package)
+                })
+                .map(|(_, id)| *id)
+                .collect();
+            ids.sort_unstable();
+            return ids;
+        }
+    };
+    for candidate in candidates {
+        if let Some(&id) = files.get(&candidate) {
+            return vec![id];
         }
     }
-    None
+    Vec::new()
+}
+
+fn go_module_path(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(root.join("go.mod")).ok()?;
+    text.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("module ")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    })
 }
 
 fn insert_file(tx: &rusqlite::Transaction, repo_id: i64, f: &SourceFile) -> Result<i64> {
@@ -334,6 +412,15 @@ pub struct GrepResult {
     pub unreadable: usize,
 }
 
+struct SpanRow {
+    id: i64,
+    name: String,
+    kind: String,
+    start: i64,
+    end: i64,
+    in_edges: i64,
+}
+
 /// Every occurrence of a literal, grouped by enclosing symbol.
 ///
 /// Searches file *contents*, not stored symbol metadata. `grep` answers "where is
@@ -346,9 +433,9 @@ pub struct GrepResult {
 /// double the database for data that goes stale the moment anyone edits.
 pub fn grep(db: &Connection, repo_id: i64, root: &Path, needle: &str) -> Result<GrepResult> {
     // Symbol spans per file, so a matching line can be attributed to a definition.
-    let mut spans: HashMap<String, Vec<(String, String, i64, i64, i64)>> = HashMap::new();
+    let mut spans: HashMap<String, Vec<SpanRow>> = HashMap::new();
     let mut stmt = db.prepare(
-        "select f.path, s.name, s.kind, s.start_line, s.end_line,
+        "select f.path, s.id, s.name, s.kind, s.start_line, s.end_line,
                 (select count(*) from edges e where e.dst_symbol_id = s.id)
            from symbols s join files f on f.id = s.file_id
           where s.repo_id = ?1 and s.kind not in ('file','module')",
@@ -356,13 +443,14 @@ pub fn grep(db: &Connection, repo_id: i64, root: &Path, needle: &str) -> Result<
     let mut rows = stmt.query([repo_id])?;
     while let Some(r) = rows.next()? {
         let path: String = r.get(0)?;
-        spans.entry(path).or_default().push((
-            r.get(1)?,
-            r.get(2)?,
-            r.get(3)?,
-            r.get(4)?,
-            r.get(5)?,
-        ));
+        spans.entry(path).or_default().push(SpanRow {
+            id: r.get(1)?,
+            name: r.get(2)?,
+            kind: r.get(3)?,
+            start: r.get(4)?,
+            end: r.get(5)?,
+            in_edges: r.get(6)?,
+        });
     }
 
     let mut files_stmt = db.prepare("select path from files where repo_id=?1 order by path")?;
@@ -380,7 +468,7 @@ pub fn grep(db: &Connection, repo_id: i64, root: &Path, needle: &str) -> Result<
             continue;
         };
         // (symbol key) -> group index, so occurrences accumulate per definition.
-        let mut seen: HashMap<Option<String>, usize> = HashMap::new();
+        let mut seen: HashMap<Option<i64>, usize> = HashMap::new();
         for (i, line_text) in text.lines().enumerate() {
             if !line_text.contains(needle) {
                 continue;
@@ -389,27 +477,32 @@ pub fn grep(db: &Connection, repo_id: i64, root: &Path, needle: &str) -> Result<
             // Innermost enclosing definition: narrowest span containing the line.
             let owner = spans.get(path).and_then(|v| {
                 v.iter()
-                    .filter(|(_, _, s, e, _)| *s <= line && line <= *e)
-                    .min_by_key(|(_, _, s, e, _)| e - s)
+                    .filter(|span| span.start <= line && line <= span.end)
+                    .min_by_key(|span| span.end - span.start)
             });
-            let key = owner.map(|(n, ..)| n.clone());
+            let key = owner.map(|span| span.id);
             let idx = match seen.get(&key) {
                 Some(&i) => i,
                 None => {
                     groups.push(Group {
                         path: path.clone(),
-                        symbol: key.clone(),
-                        kind: owner.map(|(_, k, ..)| k.clone()).unwrap_or_else(|| "file".into()),
-                        start_line: owner.map(|(_, _, s, ..)| *s).unwrap_or(0),
-                        end_line: owner.map(|(_, _, _, e, _)| *e).unwrap_or(0),
-                        in_edges: owner.map(|(_, _, _, _, n)| *n).unwrap_or(0),
+                        symbol: owner.map(|span| span.name.clone()),
+                        kind: owner
+                            .map(|span| span.kind.clone())
+                            .unwrap_or_else(|| "file".into()),
+                        start_line: owner.map(|span| span.start).unwrap_or(0),
+                        end_line: owner.map(|span| span.end).unwrap_or(0),
+                        in_edges: owner.map(|span| span.in_edges).unwrap_or(0),
                         hits: Vec::new(),
                     });
                     seen.insert(key, groups.len() - 1);
                     groups.len() - 1
                 }
             };
-            groups[idx].hits.push(Occurrence { line, text: line_text.trim().to_string() });
+            groups[idx].hits.push(Occurrence {
+                line,
+                text: line_text.trim().to_string(),
+            });
             total_hits += 1;
         }
     }
@@ -423,91 +516,21 @@ pub fn grep(db: &Connection, repo_id: i64, root: &Path, needle: &str) -> Result<
             .then_with(|| a.start_line.cmp(&b.start_line))
     });
 
-    Ok(GrepResult { groups, total_hits, files_searched: paths.len(), unreadable })
+    Ok(GrepResult {
+        groups,
+        total_hits,
+        files_searched: paths.len(),
+        unreadable,
+    })
 }
 
 pub fn repo_id_of(db: &Connection, root: &Path) -> Result<Option<i64>> {
-    let mut stmt = db.prepare("select id from repos where root=?1")?;
-    let mut rows = stmt.query([root.to_string_lossy()])?;
+    let mut stmt = db.prepare("select id from repos where root=?1 and extractor_stamp=?2")?;
+    let mut rows = stmt.query(rusqlite::params![root.to_string_lossy(), EXTRACTOR_STAMP])?;
     Ok(match rows.next()? {
         Some(r) => Some(r.get(0)?),
         None => None,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Build a throwaway repo on disk, index it, and hand back (store, root).
-    fn fixture(files: &[(&str, &str)]) -> (Connection, PathBuf) {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static N: AtomicU32 = AtomicU32::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "graft-idx-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        for (rel, body) in files {
-            let p = root.join(rel);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(p, body).unwrap();
-        }
-        let mut conn = crate::db::open(&root.join("store.db")).unwrap();
-        crate::index::build(&mut conn, &root).unwrap();
-        (conn, root)
-    }
-
-    #[test]
-    fn grep_finds_call_sites_not_just_the_definition() {
-        // The whole point of grep: a definition plus every place that uses it.
-        // Matching stored symbol names alone returns 1 hit and hides the callers.
-        let (db, root) = fixture(&[
-            ("src/a.ts", "export function serverEntry() { return 1; }\n"),
-            (
-                "src/b.ts",
-                "import { serverEntry } from './a';\nfunction runInit() { return serverEntry(); }\n",
-            ),
-        ]);
-        let id = repo_id_of(&db, &root).unwrap().unwrap();
-        let r = grep(&db, id, &root, "serverEntry").unwrap();
-
-        assert!(r.total_hits >= 3, "definition + import + call, got {}", r.total_hits);
-        let paths: Vec<_> = r.groups.iter().map(|g| g.path.as_str()).collect();
-        assert!(paths.contains(&"src/b.ts"), "must reach the calling file: {paths:?}");
-        assert!(
-            r.groups.iter().any(|g| g.symbol.as_deref() == Some("runInit")),
-            "call site must be grouped under its enclosing symbol"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn a_match_outside_any_definition_is_still_reported() {
-        // Top-level imports sit in no symbol's span. Dropping them would make an
-        // exhaustive search quietly non-exhaustive.
-        let (db, root) = fixture(&[("src/a.ts", "import { x } from './b';\nfunction f() {}\n")]);
-        let id = repo_id_of(&db, &root).unwrap().unwrap();
-        let r = grep(&db, id, &root, "import").unwrap();
-        assert_eq!(r.total_hits, 1);
-        assert_eq!(r.groups[0].symbol, None, "file-level hit, not attributed to f()");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn rebuilding_replaces_rather_than_duplicates() {
-        let (mut db, root) = fixture(&[("src/a.ts", "export function only() {}\n")]);
-        let before: i64 = db
-            .query_row("select count(*) from symbols", [], |r| r.get(0))
-            .unwrap();
-        build(&mut db, &root).unwrap();
-        let after: i64 = db
-            .query_row("select count(*) from symbols", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(before, after, "a second build must not double the symbol rows");
-        let _ = std::fs::remove_dir_all(&root);
-    }
 }
 
 /// One step away from the seed, with the distance that reached it.
@@ -521,6 +544,15 @@ pub struct Reached {
     pub depth: usize,
 }
 
+pub struct Seed {
+    pub id: i64,
+    pub name: String,
+    pub kind: String,
+    pub path: String,
+    pub start_line: i64,
+    pub end_line: i64,
+}
+
 /// Breadth-first traversal of the edge set from every symbol named `name`.
 ///
 /// `Out` follows src->dst (what this calls); the default follows dst->src (what
@@ -532,16 +564,23 @@ pub fn callers(
     name: &str,
     out: bool,
     max_depth: usize,
-) -> Result<(Vec<(i64, String, String, String, i64, i64)>, Vec<Reached>)> {
+) -> Result<(Vec<Seed>, Vec<Reached>)> {
     let mut seeds_stmt = db.prepare(
         "select s.id, s.name, s.kind, f.path, s.start_line, s.end_line
            from symbols s join files f on f.id = s.file_id
           where s.repo_id = ?1 and s.name = ?2
           order by f.path, s.start_line",
     )?;
-    let seeds: Vec<(i64, String, String, String, i64, i64)> = seeds_stmt
+    let seeds: Vec<Seed> = seeds_stmt
         .query_map(rusqlite::params![repo_id, name], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            Ok(Seed {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                kind: r.get(2)?,
+                path: r.get(3)?,
+                start_line: r.get(4)?,
+                end_line: r.get(5)?,
+            })
         })?
         .collect::<Result<_, _>>()?;
 
@@ -555,13 +594,34 @@ pub fn callers(
            from edges e
            join symbols s on s.id = e.{to_col}
            join files f on f.id = s.file_id
-          where e.repo_id = ?1 and e.{from_col} = ?2 and e.kind = 'calls'
+          where e.repo_id = ?1 and e.{from_col} = ?2 and e.kind != 'contains'
           order by f.path, s.start_line"
     );
     let mut step = db.prepare(&sql)?;
 
-    let mut seen: std::collections::HashSet<i64> = seeds.iter().map(|s| s.0).collect();
-    let mut frontier: Vec<i64> = seeds.iter().map(|s| s.0).collect();
+    let mut seen: std::collections::HashSet<i64> = seeds.iter().map(|s| s.id).collect();
+    let mut frontier: Vec<i64> = seeds.iter().map(|s| s.id).collect();
+    if max_depth > 1 {
+        let mut file_members = db.prepare(
+            "select member.id
+               from symbols file
+               join symbols member on member.file_id = file.file_id
+              where file.repo_id=?1 and file.id=?2
+                and file.kind='file' and member.kind not in ('file','module')",
+        )?;
+        for seed in &seeds {
+            if seed.kind != "file" {
+                continue;
+            }
+            let ids = file_members.query_map(rusqlite::params![repo_id, seed.id], |r| r.get(0))?;
+            for id in ids {
+                let id = id?;
+                if seen.insert(id) {
+                    frontier.push(id);
+                }
+            }
+        }
+    }
     let mut reached = Vec::new();
 
     for depth in 1..=max_depth {
@@ -704,9 +764,14 @@ pub fn repo_map(db: &Connection, repo_id: i64, top: usize) -> Result<RepoMap> {
 
     let mut per_dir: HashMap<String, (std::collections::HashSet<String>, i64, Vec<&Hub>)> =
         HashMap::new();
+    let mut file_stmt = db.prepare("select path from files where repo_id=?1 order by path")?;
+    let paths = file_stmt.query_map([repo_id], |r| r.get::<_, String>(0))?;
+    for path in paths {
+        let path = path?;
+        per_dir.entry(bucket(&path)).or_default().0.insert(path);
+    }
     for h in &all {
         let e = per_dir.entry(bucket(&h.path)).or_default();
-        e.0.insert(h.path.clone());
         e.1 += 1;
         if h.in_degree > 0 && e.2.len() < 3 {
             e.2.push(h);
@@ -734,6 +799,241 @@ pub fn repo_map(db: &Connection, repo_id: i64, top: usize) -> Result<RepoMap> {
         .collect();
     dirs.sort_by(|a, b| b.symbols.cmp(&a.symbols).then_with(|| a.dir.cmp(&b.dir)));
 
-    let hotspots = all.into_iter().filter(|h| h.in_degree > 0).take(top).collect();
-    Ok(RepoMap { files, symbols, edges, dirs, hotspots })
+    let hotspots = all
+        .into_iter()
+        .filter(|h| h.in_degree > 0)
+        .take(top)
+        .collect();
+    Ok(RepoMap {
+        files,
+        symbols,
+        edges,
+        dirs,
+        hotspots,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Build a throwaway repo on disk, index it, and hand back (store, root).
+    fn fixture(files: &[(&str, &str)]) -> (Connection, PathBuf) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "graft-idx-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for (rel, body) in files {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        }
+        let mut conn = crate::db::open(&root.join("store.db")).unwrap();
+        crate::index::build(&mut conn, &root).unwrap();
+        (conn, root)
+    }
+
+    #[test]
+    fn grep_finds_call_sites_not_just_the_definition() {
+        // The whole point of grep: a definition plus every place that uses it.
+        // Matching stored symbol names alone returns 1 hit and hides the callers.
+        let (db, root) = fixture(&[
+            ("src/a.ts", "export function serverEntry() { return 1; }\n"),
+            (
+                "src/b.ts",
+                "import { serverEntry } from './a';\nfunction runInit() { return serverEntry(); }\n",
+            ),
+        ]);
+        let id = repo_id_of(&db, &root).unwrap().unwrap();
+        let r = grep(&db, id, &root, "serverEntry").unwrap();
+
+        assert!(
+            r.total_hits >= 3,
+            "definition + import + call, got {}",
+            r.total_hits
+        );
+        let paths: Vec<_> = r.groups.iter().map(|g| g.path.as_str()).collect();
+        assert!(
+            paths.contains(&"src/b.ts"),
+            "must reach the calling file: {paths:?}"
+        );
+        assert!(
+            r.groups
+                .iter()
+                .any(|g| g.symbol.as_deref() == Some("runInit")),
+            "call site must be grouped under its enclosing symbol"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_match_outside_any_definition_is_still_reported() {
+        // Top-level imports sit in no symbol's span. Dropping them would make an
+        // exhaustive search quietly non-exhaustive.
+        let (db, root) = fixture(&[("src/a.ts", "import { x } from './b';\nfunction f() {}\n")]);
+        let id = repo_id_of(&db, &root).unwrap().unwrap();
+        let r = grep(&db, id, &root, "import").unwrap();
+        assert_eq!(r.total_hits, 1);
+        assert_eq!(
+            r.groups[0].symbol, None,
+            "file-level hit, not attributed to f()"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grep_keeps_same_named_symbols_as_separate_groups() {
+        let (db, root) = fixture(&[(
+            "src/a.ts",
+            "class A {\n  run() {\n    needle();\n  }\n}\nclass B {\n  run() {\n    needle();\n  }\n}\n",
+        )]);
+        let id = repo_id_of(&db, &root).unwrap().unwrap();
+        let r = grep(&db, id, &root, "needle").unwrap();
+        let runs: Vec<_> = r
+            .groups
+            .iter()
+            .filter(|g| g.symbol.as_deref() == Some("run"))
+            .collect();
+        assert_eq!(
+            runs.len(),
+            2,
+            "same name, distinct symbol ids/spans: {}",
+            r.groups.len()
+        );
+        assert_ne!(runs[0].start_line, runs[1].start_line);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_extractor_rows_force_a_rebuild() {
+        let (db, root) = fixture(&[("src/a.ts", "function f() {}\n")]);
+        db.execute(
+            "update repos set extractor_stamp='obsolete-extractor' where root=?1",
+            [root.to_string_lossy()],
+        )
+        .unwrap();
+        assert!(repo_id_of(&db, &root).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn python_imports_resolve_to_internal_file_nodes() {
+        let (db, root) = fixture(&[
+            (
+                "pkg/a.py",
+                "from pkg.b import helper\ndef run():\n    helper()\n",
+            ),
+            ("pkg/b.py", "def helper():\n    pass\n"),
+        ]);
+        let id = repo_id_of(&db, &root).unwrap().unwrap();
+        let imports: i64 = db
+            .query_row(
+                "select count(*) from edges e
+                   join symbols src on src.id=e.src_symbol_id
+                   join symbols dst on dst.id=e.dst_symbol_id
+                  where e.repo_id=?1 and e.kind='imports'
+                    and src.name='pkg/a.py' and dst.name='pkg/b.py'",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(imports, 1);
+        let (_, reached) = callers(&db, id, "pkg/b.py", false, 1).unwrap();
+        assert!(
+            reached
+                .iter()
+                .any(|hit| hit.name == "pkg/a.py" && hit.edge == "imports")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn go_package_imports_and_receiver_calls_resolve() {
+        let (db, root) = fixture(&[
+            ("go.mod", "module example.com/project\n"),
+            (
+                "main.go",
+                "package main\nimport _ \"example.com/project/pkg\"\nfunc main() {}\n",
+            ),
+            (
+                "pkg/worker.go",
+                "package pkg\ntype Worker struct{}\nfunc (w *Worker) Step() {}\nfunc (w *Worker) Run() { w.Step() }\n",
+            ),
+        ]);
+        let id = repo_id_of(&db, &root).unwrap().unwrap();
+        let imports: i64 = db
+            .query_row(
+                "select count(*) from edges e
+                   join symbols src on src.id=e.src_symbol_id
+                   join symbols dst on dst.id=e.dst_symbol_id
+                  where e.repo_id=?1 and e.kind='imports'
+                    and src.name='main.go' and dst.name='pkg/worker.go'",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(imports, 1);
+        let calls: i64 = db
+            .query_row(
+                "select count(*) from edges e
+                   join symbols src on src.id=e.src_symbol_id
+                   join symbols dst on dst.id=e.dst_symbol_id
+                  where e.repo_id=?1 and e.kind='calls'
+                    and src.name='Run' and dst.name='Step'",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(calls, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn callers_aggregates_symbols_defined_by_a_file_seed() {
+        let (db, root) = fixture(&[
+            ("src/a.ts", "export function target() {}\n"),
+            ("src/b.ts", "function run() { target(); }\n"),
+        ]);
+        let id = repo_id_of(&db, &root).unwrap().unwrap();
+        let (_, reached) = callers(&db, id, "src/a.ts", false, 2).unwrap();
+        assert!(
+            reached
+                .iter()
+                .any(|hit| hit.name == "run" && hit.edge == "calls")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repo_map_counts_files_without_definitions() {
+        let (db, root) = fixture(&[("config/settings.py", "VALUE = 1\n")]);
+        let id = repo_id_of(&db, &root).unwrap().unwrap();
+        let map = repo_map(&db, id, 12).unwrap();
+        let config = map.dirs.iter().find(|d| d.dir == "config/").unwrap();
+        assert_eq!(config.files, 1);
+        assert_eq!(config.symbols, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rebuilding_replaces_rather_than_duplicates() {
+        let (mut db, root) = fixture(&[("src/a.ts", "export function only() {}\n")]);
+        let before: i64 = db
+            .query_row("select count(*) from symbols", [], |r| r.get(0))
+            .unwrap();
+        build(&mut db, &root).unwrap();
+        let after: i64 = db
+            .query_row("select count(*) from symbols", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "a second build must not double the symbol rows"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

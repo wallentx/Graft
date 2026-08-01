@@ -32,15 +32,6 @@ impl Lang {
             _ => None,
         }
     }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Lang::TypeScript => "typescript",
-            Lang::Tsx => "tsx",
-            Lang::Python => "python",
-            Lang::Go => "go",
-        }
-    }
 }
 
 /// The realpath of the git toplevel containing `start`.
@@ -53,12 +44,12 @@ pub fn root_of(start: &Path) -> Result<PathBuf> {
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(start)
         .output();
-    if let Ok(o) = out {
-        if o.status.success() {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if !s.is_empty() {
-                return std::fs::canonicalize(&s).with_context(|| format!("canonicalize {s}"));
-            }
+    if let Ok(o) = out
+        && o.status.success()
+    {
+        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        if !s.is_empty() {
+            return std::fs::canonicalize(&s).with_context(|| format!("canonicalize {s}"));
         }
     }
     std::fs::canonicalize(start).with_context(|| format!("canonicalize {}", start.display()))
@@ -89,7 +80,6 @@ pub fn git_common_dir(root: &Path) -> Option<String> {
 
 pub struct SourceFile {
     pub rel: String,
-    pub abs: PathBuf,
     pub lang: Lang,
     pub text: String,
     pub mtime: i64,
@@ -153,7 +143,6 @@ pub fn walk(root: &Path) -> Result<Vec<SourceFile>> {
             .replace('\\', "/");
         out.push(SourceFile {
             rel,
-            abs: abs.to_path_buf(),
             lang,
             hash: fnv1a(text.as_bytes()),
             size: text.len() as i64,
@@ -175,7 +164,11 @@ mod tests {
     fn lang_of_path_skips_declaration_files() {
         assert_eq!(Lang::of_path(Path::new("a/b.ts")), Some(Lang::TypeScript));
         assert_eq!(Lang::of_path(Path::new("a/b.tsx")), Some(Lang::Tsx));
-        assert_eq!(Lang::of_path(Path::new("a/b.d.ts")), None, ".d.ts has no bodies to index");
+        assert_eq!(
+            Lang::of_path(Path::new("a/b.d.ts")),
+            None,
+            ".d.ts has no bodies to index"
+        );
         assert_eq!(Lang::of_path(Path::new("a/b.js")), None);
         assert_eq!(Lang::of_path(Path::new("README.md")), None);
     }
@@ -186,9 +179,17 @@ mod tests {
         // implementation's own output. If they ever change, every stored file hash
         // is invalidated and every indexed repo cold-reparses — that should be a
         // deliberate schema bump, not an accident.
-        assert_eq!(fnv1a(b""), "cbf29ce484222325", "the FNV-1a 64-bit offset basis");
+        assert_eq!(
+            fnv1a(b""),
+            "cbf29ce484222325",
+            "the FNV-1a 64-bit offset basis"
+        );
         assert_eq!(fnv1a(b"graft"), "32a1802977be3e45");
         assert_ne!(fnv1a(b"graft"), fnv1a(b"graftx"));
-        assert_eq!(fnv1a(b"graft").len(), 16, "zero-padded, so hashes sort as text");
+        assert_eq!(
+            fnv1a(b"graft").len(),
+            16,
+            "zero-padded, so hashes sort as text"
+        );
     }
 }

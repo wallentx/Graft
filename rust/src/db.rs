@@ -121,8 +121,7 @@ pub fn default_path() -> Result<PathBuf> {
 /// Open (creating if absent), enable WAL and foreign keys, and apply the schema.
 pub fn open(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let db = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
 
@@ -131,7 +130,10 @@ pub fn open(path: &Path) -> Result<Connection> {
     // filesystem without the shared memory WAL needs will quietly stay in
     // rollback mode, and every concurrent read would then block behind a build.
     let mode: String = db.query_row("pragma journal_mode=wal", [], |r| r.get(0))?;
-    anyhow::ensure!(mode.eq_ignore_ascii_case("wal"), "journal_mode is {mode:?}, not wal");
+    anyhow::ensure!(
+        mode.eq_ignore_ascii_case("wal"),
+        "journal_mode is {mode:?}, not wal"
+    );
     db.execute_batch("pragma foreign_keys=on; pragma synchronous=normal;")?;
 
     let found: i64 = db.query_row("pragma user_version", [], |r| r.get(0))?;
@@ -214,7 +216,9 @@ mod tests {
         let g = tempdir::Guard::new();
         let p = g.path().join("graft.db");
         let db = open(&p).unwrap();
-        let v: i64 = db.query_row("pragma user_version", [], |r| r.get(0)).unwrap();
+        let v: i64 = db
+            .query_row("pragma user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
         drop(db);
         open(&p).expect("re-opening an existing store must not fail");
@@ -248,7 +252,10 @@ mod tests {
             [],
         )
         .unwrap();
-        assert!(hit("parse*").is_empty(), "update must retract the old terms");
+        assert!(
+            hit("parse*").is_empty(),
+            "update must retract the old terms"
+        );
         assert_eq!(hit("rename*"), vec!["renameRepo".to_string()], "update");
 
         db.execute("delete from symbols", []).unwrap();
@@ -257,8 +264,11 @@ mod tests {
         // The index and its content table must still agree; external-content FTS5
         // reports drift here rather than at query time, where it surfaces as the
         // far less obvious "database disk image is malformed".
-        db.execute("insert into symbols_fts(symbols_fts) values('integrity-check')", [])
-            .expect("fts index and content table disagree");
+        db.execute(
+            "insert into symbols_fts(symbols_fts) values('integrity-check')",
+            [],
+        )
+        .expect("fts index and content table disagree");
     }
 
     #[test]
@@ -302,6 +312,9 @@ mod tests {
              values ('/src/demo', 2, 'stamp-b')",
             [],
         );
-        assert!(again.is_err(), "repos.root is the lookup key; duplicates would make it ambiguous");
+        assert!(
+            again.is_err(),
+            "repos.root is the lookup key; duplicates would make it ambiguous"
+        );
     }
 }
