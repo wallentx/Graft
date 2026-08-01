@@ -15,6 +15,8 @@ use std::process::Command;
 pub enum Lang {
     TypeScript,
     Tsx,
+    Python,
+    Go,
 }
 
 impl Lang {
@@ -25,6 +27,8 @@ impl Lang {
             // names that outrank the real definition.
             "ts" if !p.to_string_lossy().ends_with(".d.ts") => Some(Lang::TypeScript),
             "tsx" => Some(Lang::Tsx),
+            "py" => Some(Lang::Python),
+            "go" => Some(Lang::Go),
             _ => None,
         }
     }
@@ -33,6 +37,8 @@ impl Lang {
         match self {
             Lang::TypeScript => "typescript",
             Lang::Tsx => "tsx",
+            Lang::Python => "python",
+            Lang::Go => "go",
         }
     }
 }

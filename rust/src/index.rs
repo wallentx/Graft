@@ -186,9 +186,11 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
             // the bare name would match every same-named method in the repo and be
             // dropped as ambiguous.
             if let Some(recv) = &c.receiver {
-                let ty = if recv == "this" {
+                // `self` in Python and Go-style receivers behave exactly as `this`
+                // does in TypeScript: they name the enclosing type.
+                let ty = if recv == "this" || recv == "self" {
                     c.from.and_then(|i| ex.containers.get(i).cloned().flatten())
-                } else if let Some(field) = recv.strip_prefix("this.") {
+                } else if let Some(field) = recv.strip_prefix("this.").or_else(|| recv.strip_prefix("self.")) {
                     // A field binding is scoped to the class, not the method.
                     let class = c.from.and_then(|i| ex.containers.get(i).cloned().flatten());
                     class.and_then(|cls| {
@@ -196,7 +198,12 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
                             .iter()
                             .position(|s| s.name == cls && s.kind == "class")
                             .and_then(|ci| {
-                                binds.get(&(Some(ci), format!("this.{field}").as_str())).copied()
+                                // Stored under the bare field name for Python, and
+                                // under `this.<field>` for TypeScript.
+                                binds
+                                    .get(&(Some(ci), format!("this.{field}").as_str()))
+                                    .or_else(|| binds.get(&(Some(ci), field)))
+                                    .copied()
                             })
                             .map(str::to_string)
                     })

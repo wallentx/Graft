@@ -111,16 +111,114 @@ const TS_BINDINGS: &str = r#"
   type: (type_annotation (type_identifier) @ty))
 "#;
 
+/// Per-language queries. Each language is a set of four queries over the same
+/// machinery — definitions, calls, bindings, imports — so adding one is data
+/// rather than another arm of a recursive walk.
+struct Queries {
+    defs: &'static str,
+    calls: &'static str,
+    bindings: &'static str,
+    imports: &'static str,
+}
+
+const PY_DEFS: &str = r#"
+(function_definition name: (identifier) @name) @def
+(class_definition name: (identifier) @name) @def
+"#;
+
+/// `f()` and `obj.f()`. Python has no `new`, so a constructor call is an ordinary
+/// call to the class name and needs no separate pattern.
+const PY_CALLS: &str = r#"
+(call function: (identifier) @callee)
+(call function: (attribute object: (_) @recv attribute: (identifier) @callee))
+"#;
+
+/// Annotated assignment (`x: Repo = ...`), constructor assignment (`x = Repo()`),
+/// and annotated parameters. `self.x` is stored the same way `this.x` is in TS.
+const PY_BINDINGS: &str = r#"
+(assignment left: (identifier) @name type: (type (identifier) @ty))
+(assignment left: (identifier) @name right: (call function: (identifier) @ty))
+(typed_parameter (identifier) @name type: (type (identifier) @ty))
+(assignment
+  left: (attribute object: (identifier) attribute: (identifier) @field)
+  right: (call function: (identifier) @ty))
+"#;
+
+const PY_IMPORTS: &str = r#"
+(import_statement name: (dotted_name) @spec)
+(import_from_statement module_name: (dotted_name) @spec)
+"#;
+
+/// Go has no lexical nesting for methods, so a method's container cannot be found
+/// by enclosing span the way a TypeScript or Python one can. It comes from the
+/// receiver instead, with a pointer receiver unwrapped: `func (w *Worker) Run()`
+/// belongs to `Worker`.
+const GO_DEFS: &str = r#"
+(function_declaration name: (identifier) @name) @def
+(method_declaration
+  receiver: (parameter_list (parameter_declaration
+    type: [(pointer_type (type_identifier) @recvty) (type_identifier) @recvty]))
+  name: (field_identifier) @name) @def
+(type_declaration (type_spec name: (type_identifier) @name)) @def
+"#;
+
+const GO_CALLS: &str = r#"
+(call_expression function: (identifier) @callee)
+(call_expression function: (selector_expression operand: (_) @recv field: (field_identifier) @callee))
+"#;
+
+/// `var x T`, `x := T{}`, and typed parameters. The receiver of a method is bound
+/// separately, since its type is what `w.foo()` inside the method resolves against.
+const GO_BINDINGS: &str = r#"
+(var_declaration (var_spec name: (identifier) @name type: (type_identifier) @ty))
+(short_var_declaration
+  left: (expression_list (identifier) @name)
+  right: (expression_list (composite_literal type: (type_identifier) @ty)))
+(parameter_declaration name: (identifier) @name type: (type_identifier) @ty)
+"#;
+
+const GO_IMPORTS: &str = r#"
+(import_spec path: (interpreted_string_literal) @spec)
+"#;
+
+fn queries(lang: Lang) -> Queries {
+    match lang {
+        Lang::TypeScript | Lang::Tsx => Queries {
+            defs: TS_DEFS,
+            calls: TS_CALLS,
+            bindings: TS_BINDINGS,
+            imports: TS_IMPORTS,
+        },
+        Lang::Python => Queries {
+            defs: PY_DEFS,
+            calls: PY_CALLS,
+            bindings: PY_BINDINGS,
+            imports: PY_IMPORTS,
+        },
+        Lang::Go => Queries {
+            defs: GO_DEFS,
+            calls: GO_CALLS,
+            bindings: GO_BINDINGS,
+            imports: GO_IMPORTS,
+        },
+    }
+}
+
 fn language(lang: Lang) -> tree_sitter::Language {
     match lang {
         Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        Lang::Python => tree_sitter_python::LANGUAGE.into(),
+        Lang::Go => tree_sitter_go::LANGUAGE.into(),
     }
 }
 
 /// A node's kind, mapped to the vocabulary stored in `symbols.kind`.
 fn kind_of(n: &Node) -> &'static str {
     match n.kind() {
+        "class_definition" => "class",
+        "method_declaration" => "method",
+        "type_spec" | "type_declaration" => "type",
         "class_declaration" => "class",
         "interface_declaration" => "interface",
         "type_alias_declaration" => "type",
@@ -152,7 +250,8 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
     let tree = parser.parse(src, None).context("parse returned no tree")?;
     let root = tree.root_node();
 
-    let def_q = Query::new(&ts_lang, TS_DEFS).context("compile definition query")?;
+    let q = queries(lang);
+    let def_q = Query::new(&ts_lang, q.defs).context("compile definition query")?;
     let name_idx = def_q
         .capture_index_for_name("name")
         .context("query lacks @name")?;
@@ -160,6 +259,9 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
         .capture_index_for_name("def")
         .context("query lacks @def")?;
 
+    let recvty_idx = def_q.capture_index_for_name("recvty");
+    // Parallel to `symbols`: a Go method's receiver type, filled during the walk.
+    let mut recv_types: Vec<Option<String>> = Vec::new();
     let mut symbols: Vec<Symbol> = Vec::new();
     // Byte span of each symbol, kept parallel to `symbols`, so a call site can be
     // attributed to the innermost definition containing it.
@@ -182,6 +284,11 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
             signature: signature_of(src, &def_node),
         });
         spans.push((def_node.start_byte(), def_node.end_byte()));
+        recv_types.push(
+            recvty_idx
+                .and_then(|i| m.captures.iter().find(|c| c.index == i))
+                .map(|c| src[c.node.byte_range()].to_string()),
+        );
     }
 
     // Innermost definition containing a byte offset. Narrowest wins, so a call in
@@ -194,16 +301,6 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
             .min_by_key(|(_, (s, e))| e - s)
             .map(|(i, _)| i)
     };
-    // Innermost enclosing *class*, which is what a method's container is.
-    let class_at = |at: usize| -> Option<usize> {
-        spans
-            .iter()
-            .enumerate()
-            .filter(|(i, (s, e))| *s <= at && at < *e && symbols[*i].kind == "class")
-            .min_by_key(|(_, (s, e))| e - s)
-            .map(|(i, _)| i)
-    };
-
     // Innermost enclosing symbol of any kind, excluding the symbol itself. This is
     // what `contains` is built from: class->method, function->nested function, and
     // (where None) file->top-level definition.
@@ -219,6 +316,30 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
         })
         .collect();
 
+    // Python has one definition node for both, so a function whose parent is a
+    // class is reclassified here. Without it Python methods carry no container and
+    // no member call against them can ever resolve.
+    for i in 0..symbols.len() {
+        if symbols[i].kind == "function" {
+            if let Some(p) = parents[i] {
+                if symbols[p].kind == "class" {
+                    symbols[i].kind = "method".to_string();
+                }
+            }
+        }
+    }
+
+    // Innermost enclosing *class*. Declared after the reclassification above so it
+    // borrows `symbols` only once the kinds are final.
+    let class_at = |at: usize| -> Option<usize> {
+        spans
+            .iter()
+            .enumerate()
+            .filter(|(i, (s, e))| *s <= at && at < *e && symbols[*i].kind == "class")
+            .min_by_key(|(_, (s, e))| e - s)
+            .map(|(i, _)| i)
+    };
+
     let containers: Vec<Option<String>> = symbols
         .iter()
         .enumerate()
@@ -226,13 +347,14 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
             if sym.kind != "method" {
                 return None;
             }
-            // A method's own span is inside its class's span, so search from just
-            // past its start to avoid matching itself.
-            class_at(spans[i].0).map(|c| symbols[c].name.clone())
+            // Go: the receiver type. Everywhere else: the enclosing class.
+            recv_types[i]
+                .clone()
+                .or_else(|| class_at(spans[i].0).map(|c| symbols[c].name.clone()))
         })
         .collect();
 
-    let call_q = Query::new(&ts_lang, TS_CALLS).context("compile call query")?;
+    let call_q = Query::new(&ts_lang, q.calls).context("compile call query")?;
     let callee_idx = call_q.capture_index_for_name("callee").context("query lacks @callee")?;
     let recv_idx = call_q.capture_index_for_name("recv").context("query lacks @recv")?;
     let mut calls = Vec::new();
@@ -256,9 +378,10 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
         });
     }
 
-    let bind_q = Query::new(&ts_lang, TS_BINDINGS).context("compile binding query")?;
+    let bind_q = Query::new(&ts_lang, q.bindings).context("compile binding query")?;
     let b_name = bind_q.capture_index_for_name("name");
     let b_field = bind_q.capture_index_for_name("field");
+    let _ = &b_field;
     let b_ty = bind_q.capture_index_for_name("ty").context("query lacks @ty")?;
     let mut bindings = Vec::new();
     let mut cursor = QueryCursor::new();
@@ -289,7 +412,7 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
         }
     }
 
-    let imp_q = Query::new(&ts_lang, TS_IMPORTS).context("compile import query")?;
+    let imp_q = Query::new(&ts_lang, q.imports).context("compile import query")?;
     let mut imports = Vec::new();
     let mut cursor = QueryCursor::new();
     let mut it = cursor.matches(&imp_q, root, src.as_bytes());
@@ -421,5 +544,109 @@ function helper(): void {}
         let e = extract(Lang::Tsx, "const App = () => <div>hi</div>;").unwrap();
         assert_eq!(e.symbols.len(), 1);
         assert_eq!(e.symbols[0].name, "App");
+    }
+}
+
+#[cfg(test)]
+mod lang_tests {
+    use super::*;
+
+    #[test]
+    fn python_definitions_calls_and_receiver_binding() {
+        let src = r#"
+import os
+from pkg.mod import helper
+
+class Repo:
+    def scan(self):
+        return 1
+
+def main():
+    r = Repo()
+    r.scan()
+    helper()
+"#;
+        let e = extract(Lang::Python, src).unwrap();
+        let names: Vec<_> = e.symbols.iter().map(|s| (s.name.as_str(), s.kind.as_str())).collect();
+        assert!(names.contains(&("Repo", "class")), "{names:?}");
+        assert!(names.contains(&("scan", "method")), "a def inside a class is a method: {names:?}");
+        assert_eq!(
+            e.containers[e.symbols.iter().position(|s| s.name == "scan").unwrap()].as_deref(),
+            Some("Repo"),
+            "without a container, r.scan() can never resolve"
+        );
+        assert!(names.contains(&("main", "function")), "{names:?}");
+
+        // `r = Repo()` is a constructor binding, which is what lets r.scan()
+        // resolve to Repo.scan rather than to every method named scan.
+        assert!(
+            e.bindings.iter().any(|b| b.name == "r" && b.ty == "Repo"),
+            "{:?}", e.bindings
+        );
+        assert!(e.calls.iter().any(|c| c.callee == "scan" && c.receiver.as_deref() == Some("r")));
+        assert!(e.calls.iter().any(|c| c.callee == "helper" && c.receiver.is_none()));
+        assert!(e.imports.iter().any(|i| i == "os"), "{:?}", e.imports);
+        assert!(e.imports.iter().any(|i| i == "pkg.mod"), "{:?}", e.imports);
+    }
+
+    #[test]
+    fn python_methods_are_contained_by_their_class() {
+        let e = extract(Lang::Python, "class A:\n    def m(self):\n        pass\n").unwrap();
+        let m = e.symbols.iter().position(|s| s.name == "m").unwrap();
+        let a = e.symbols.iter().position(|s| s.name == "A").unwrap();
+        assert_eq!(e.parents[m], Some(a), "contains must link A -> m");
+    }
+
+    #[test]
+    fn python_binds_self_fields_from_constructor_assignment() {
+        // `self.store.fetch()` only resolves if `self.store = Store()` is recorded
+        // as a field binding scoped to the class.
+        let e = extract(
+            Lang::Python,
+            "class S:\n    def __init__(self):\n        self.store = Store()\n",
+        )
+        .unwrap();
+        assert!(
+            e.bindings.iter().any(|b| b.name.ends_with("store") && b.ty == "Store"),
+            "{:?}", e.bindings
+        );
+    }
+
+    #[test]
+    fn go_definitions_and_method_receivers() {
+        let src = r#"
+package main
+
+import "fmt"
+
+type Worker struct{ n int }
+
+func (w *Worker) Run() {
+	fmt.Println(w.n)
+}
+
+func main() {
+	var w Worker
+	w.Run()
+}
+"#;
+        let e = extract(Lang::Go, src).unwrap();
+        let names: Vec<_> = e.symbols.iter().map(|s| (s.name.as_str(), s.kind.as_str())).collect();
+        assert!(names.contains(&("Worker", "type")), "{names:?}");
+        assert!(names.contains(&("Run", "method")), "{names:?}");
+        assert!(names.contains(&("main", "function")), "{names:?}");
+
+        assert!(
+            e.bindings.iter().any(|b| b.name == "w" && b.ty == "Worker"),
+            "`var w Worker` must bind: {:?}", e.bindings
+        );
+        assert!(e.calls.iter().any(|c| c.callee == "Run" && c.receiver.as_deref() == Some("w")));
+        assert!(e.imports.iter().any(|i| i == "fmt"), "{:?}", e.imports);
+        // Go methods are not lexically nested, so the container comes from the
+        // receiver — with the pointer unwrapped.
+        assert_eq!(
+            e.containers[e.symbols.iter().position(|s| s.name == "Run").unwrap()].as_deref(),
+            Some("Worker")
+        );
     }
 }
