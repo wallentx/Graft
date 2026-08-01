@@ -55,6 +55,18 @@ export const HOSTS: HostTarget[] = [
     detect: (p) => p.dirExists(join(p.home, '.cursor')) || p.dirExists(join(p.repo, '.cursor')),
   },
   {
+    id: 'antigravity',
+    name: 'Antigravity CLI',
+    kind: 'section',
+    relPath: 'GEMINI.md',
+    content: instructionBody,
+    detect: (p) =>
+      p.dirExists(join(p.home, '.gemini', 'antigravity-cli')) ||
+      p.dirExists(join(p.home, '.antigravity')) ||
+      p.dirExists(join(p.repo, '.gemini', 'antigravity-cli')) ||
+      p.dirExists(join(p.repo, '.antigravity')),
+  },
+  {
     id: 'gemini',
     name: 'Gemini CLI',
     kind: 'section',

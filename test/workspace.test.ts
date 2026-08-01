@@ -119,7 +119,7 @@ test("ask inside a single child = standalone (no federation scopes)", async () =
   rmSync(p, { recursive: true, force: true });
 });
 
-test("migration: mega-graph parent split → .graph removed, workspace.json written, exact note", async () => {
+test("migration: workspace index becomes authoritative without deleting the old graph", async () => {
   const p = workspaceFx(REPOS);
   // Pre-seed a hand-built combined mega-graph at the parent.
   const mega: GraphV1 = {
@@ -132,13 +132,32 @@ test("migration: mega-graph parent split → .graph removed, workspace.json writ
 
   const { migrated } = await buildWorkspace(p);
   assert.equal(migrated, true);
-  assert.equal(existsSync(wiringPath(contextDirFor(p))), false); // mega-graph gone
+  assert.equal(existsSync(wiringPath(contextDirFor(p))), true); // inert cache preserved; no destructive migration
   assert.equal(existsSync(join(contextDirFor(p), "workspace.json")), true);
 
   assert.equal(
     migrationNote(["repoA", "repoB"]),
     "⚠ this folder contains 2 separate git repos — splitting: each repo now gets its own committable graft/ (repoA/graft/, repoB/graft/); the combined graph here is replaced by a workspace index. Queries from here now search all repos, fairly.",
   );
+  rmSync(p, { recursive: true, force: true });
+});
+
+test("workspace conversion never deletes files from a custom --dir", async () => {
+  const p = workspaceFx(REPOS);
+  const out = join(p, "shared-output");
+  mkdirSync(out);
+  writeFileSync(join(out, "keep.txt"), "foreign root file\n");
+  writeGraph({
+    meta: { version: 1, nodeCount: 0, edgeCount: 0, languages: [] },
+    nodes: [],
+    edges: [],
+  }, out);
+
+  await splitWorkspace(p, out, async (childDir) => buildGraph(childDir));
+
+  assert.equal(readFileSync(join(out, "keep.txt"), "utf8"), "foreign root file\n");
+  assert.equal(existsSync(wiringPath(out)), true, "old graph preserved");
+  assert.deepEqual(readWorkspace(p, out), { version: 1, children: ["repoA", "repoB"] });
   rmSync(p, { recursive: true, force: true });
 });
 

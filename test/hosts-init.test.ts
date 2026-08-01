@@ -1,9 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-// The MCP launch command is resolved from PATH at init time; pin it to the npx
-// form so these expectations are the same on every machine.
-process.env.GRAFT_MCP_NPX = '1';
 import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -33,7 +30,7 @@ test('explicit agents list overrides detection and flags unknown ids', () => {
 test('all writes every host and re-run converges (idempotent)', () => {
   const home = fresh(); const repo = fresh();
   const first = runHostsInit(repo, { home, all: true });
-  assert.equal(first.written.length, 7);
+  assert.equal(first.written.length, 8);
   const second = runHostsInit(repo, { home, all: true });
   assert.ok(second.written.every((w) => w.action === 'unchanged'));
   const agents = readFileSync(join(repo, 'AGENTS.md'), 'utf8');
@@ -108,7 +105,7 @@ test('runHostsInit registers MCP configs for selected hosts', () => {
   assert.equal(r.mcp.length, 1);
   assert.match(r.mcp[0].path, /\.cursor\/mcp\.json$/);
   const cfg = JSON.parse(readFileSync(join(repo, '.cursor', 'mcp.json'), 'utf8'));
-  assert.equal(cfg.mcpServers.graft.command, 'npx');
+  assert.equal(cfg.mcpServers.graft.command, 'graft');
 });
 
 test('mcp: false skips MCP registration', () => {

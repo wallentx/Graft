@@ -4,7 +4,6 @@
  * map, init. Git is the sync: commit graft/ and a clone has the graph. A
  * workspace parent (≥2 git children) federates query commands across children.
  */
-import "dotenv/config";
 import { Command } from "commander";
 import { relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,7 +31,7 @@ import { formatInitEpilogue } from "./cli-epilogue.js";
 import { planInit, selectedWrites } from "./hosts/plan.js";
 import { formatNonInteractiveHelp, formatPlan, runPicker } from "./cli-picker.js";
 import { homedir } from "node:os";
-import { formatUpgradeReport, formatVersionReport, getNpmViewVersion, readCurrentVersion, runUpgrade } from "./cli-meta.js";
+import { formatUpgradeReport, formatVersionReport, getNpmViewVersion, isTermuxEnvironment, readCurrentVersion, runUpgrade } from "./cli-meta.js";
 
 const program = new Command();
 const currentVersion = readCurrentVersion(import.meta.url);
@@ -93,19 +92,23 @@ const NO_REFRESH_FLAG = ["--no-refresh", "skip the freshness check — answer fr
 
 program
   .command("version")
-  .description("Print the installed version and the latest published on npm")
+  .description("Print the installed version and, outside Termux, the latest published on npm")
   .action(() => {
+    if (isTermuxEnvironment()) {
+      console.log(`graft ${currentVersion}\nTermux build: registry update checks disabled`);
+      return;
+    }
     const latest = getNpmViewVersion();
     console.log(formatVersionReport(currentVersion, latest));
   });
 
 program
   .command("upgrade")
-  .description("Upgrade the globally installed graft to the latest version on npm")
+  .description("Upgrade the global install from npm (disabled on Termux)")
   .action(() => {
     const result = runUpgrade(import.meta.url);
     console.log(formatUpgradeReport(result));
-    if (result.ran && !result.ok) process.exit(1);
+    if (!result.ok) process.exit(1);
   });
 
 program

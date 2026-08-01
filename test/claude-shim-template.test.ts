@@ -3,15 +3,13 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { statuslineShim, hooksShim } from '../src/claude/shim-template.js';
 
-const BAKED = '/opt/graft/dist/claude';
-
-for (const [name, src] of [['statusline', statuslineShim(BAKED)], ['hooks', hooksShim(BAKED)]] as const) {
-  test(`${name} shim parses and resolves via baked → node_modules → lib → npm root -g`, () => {
+for (const [name, src] of [['statusline', statuslineShim()], ['hooks', hooksShim()]] as const) {
+  test(`${name} shim parses and resolves via node_modules → lib → npm root -g`, () => {
     const body = src.replace(/^#!.*\n/, ''); // strip shebang for vm
     assert.doesNotThrow(() => new vm.Script(body), 'valid JS');
 
-    // 1. baked dir is present as the first candidate
-    assert.match(src, new RegExp(`const BAKED = "${BAKED}"`));
+    // 1. no machine-local path is embedded in a committed shim
+    assert.doesNotMatch(src, /const BAKED/);
     // 2. repo node_modules via require.resolve from the project dir
     assert.match(src, /require\.resolve\('@nanonets\/graft\/package\.json', \{ paths: \[base\] \}\)/);
     assert.match(src, /fromPkg\(dir\)/);
@@ -28,6 +26,6 @@ for (const [name, src] of [['statusline', statuslineShim(BAKED)], ['hooks', hook
 }
 
 test('statusline calls main(); hooks passes the event arg', () => {
-  assert.match(statuslineShim(BAKED), /m\.main\(\)/);
-  assert.match(hooksShim(BAKED), /m\.main\(process\.argv\[2\]\)/);
+  assert.match(statuslineShim(), /m\.main\(\)/);
+  assert.match(hooksShim(), /m\.main\(process\.argv\[2\]\)/);
 });

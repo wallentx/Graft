@@ -4,7 +4,6 @@ const fs = require('fs');
 const { pathToFileURL } = require('url');
 const { execFileSync } = require('child_process');
 const dir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
-const BAKED = "/Users/shrishdwivedi/Documents/Context graphs/context-graph-engine/dist/claude";
 
 // The dist/claude dir of @nanonets/graft resolved from a base whose node_modules is searched.
 function fromPkg(base) {
@@ -24,7 +23,6 @@ function globalRoot() {
 
 function candidates() {
   const out = [];
-  if (BAKED) out.push(BAKED);
   const local = fromPkg(dir); if (local) out.push(local);
   const legacy = fromPkg(path.join(path.dirname(process.execPath), '..', 'lib')); if (legacy) out.push(legacy);
   const gr = globalRoot(); if (gr) out.push(path.join(gr, '@nanonets', 'graft', 'dist', 'claude'));

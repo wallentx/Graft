@@ -62,9 +62,9 @@ export interface Drift {
 }
 
 /** `<outDir>/.cache/fingerprint.<stamp>.json` — keyed by extractor identity for the
- * same reason the memo is (see {@link extractCachePath}): two grafts on one repo,
- * typically an `npx` MCP server and a locally installed hook binary, must not keep
- * invalidating each other's prints and forcing a cold rebuild on every call. */
+ * same reason the memo is (see {@link extractCachePath}): two installed graft
+ * versions working on one repo must not keep invalidating each other's prints and
+ * forcing a cold rebuild on every call. */
 export function fingerprintPath(outDir: string): string {
   return join(outDir, CACHE_DIR, `${FINGERPRINT_PREFIX}.${stamp()}.json`);
 }

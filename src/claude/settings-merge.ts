@@ -8,10 +8,10 @@ const FOOTER = 'graft/[\\w./-]+\\.md';
 // call that raises a permission prompt loses to grep, which never does.
 const ALLOW_ENTRIES = [
   'Bash(graft:*)',
-  'Bash(npx graft:*)',
   'Bash(graft-dev:*)',
   'Bash(node dist/cli.js:*)',
 ];
+const RETIRED_ALLOW_ENTRIES = new Set(['Bash(npx graft:*)']);
 
 function hookCmd(arg: string): string {
   return `node "\${CLAUDE_PROJECT_DIR:-.}/.claude/helpers/graft-hooks.cjs" ${arg}`;
@@ -69,7 +69,12 @@ export function mergeGraftSettings(existing: Json): { merged: Json; warnings: st
   // headless/subagent runs hard-deny Bash by default; without an allowlist entry
   // `graft ask`'s own Bash calls (and the skill it installs) can't run out-of-box.
   merged.permissions = { ...(merged.permissions ?? {}) };
-  const allow = Array.isArray(merged.permissions.allow) ? [...merged.permissions.allow] : [];
+  // Re-init retracts the package-manager execution permission written by older
+  // Graft versions. This literal is migration-only; it is never executed or
+  // added to a generated configuration.
+  const allow = Array.isArray(merged.permissions.allow)
+    ? merged.permissions.allow.filter((entry: unknown) => !RETIRED_ALLOW_ENTRIES.has(String(entry)))
+    : [];
   for (const entry of ALLOW_ENTRIES) {
     if (!allow.includes(entry)) allow.push(entry);
   }

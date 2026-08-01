@@ -258,7 +258,7 @@ test("two grafts on one repo keep separate memos instead of evicting each other"
   assert.ok(basename(fingerprintPath(outOf(d))).includes(extractorStamp()!), "same for the probe sidecar");
 
   // Stand in for the other install — `graft init` wires the MCP server as
-  // `npx -y @nanonets/graft` while the hooks run the locally installed dist, so two
+  // an older MCP config while hooks run the newly installed dist, so two
   // different versions on one repo is the DEFAULT setup, not an exotic one. With a
   // single shared filename they took turns rejecting each other's entries and
   // cold-re-parsing the whole repo on every call.

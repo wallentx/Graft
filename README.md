@@ -56,10 +56,24 @@
 
 ## Quick start
 
+Install this fork's `dev` branch on any supported platform:
+
 ```bash
-npm install -g @nanonets/graft   # install the CLI, once
+npm install -g 'git+https://github.com/wallentx/Graft.git#dev'
 graft init                       # build the graph + wire it into Claude Code
 ```
+
+On Termux, install the native build toolchain first. Graft's Tree-sitter parsers
+compile from source on Android, so the first install can take a few minutes. Then
+use the same fork-and-branch install command shown above:
+
+```bash
+pkg install git nodejs python make clang
+npm install -g 'git+https://github.com/wallentx/Graft.git#dev'
+```
+
+The `dev` branch is intentionally mutable. For a reproducible install, replace
+`dev` with a reviewed full commit SHA.
 
 That is the whole setup. `graft init` asks which of your coding agents to wire up, builds `graft/` from your code, and drops a statusline and hooks into `.claude/`, so from the next session on Graft rides along in Claude Code: it pulls the matching nodes into each prompt and rebuilds the graph in the background after every turn. No daemon, no re-indexing to remember, nothing to run or maintain by default — the graph is just files.
 
@@ -70,8 +84,6 @@ Nothing is written until you pick. Run `graft init --dry-run` to see every file 
 ```bash
 git add .claude && git commit -m "wire in graft"
 ```
-
-Prefer not to install globally? `npx @nanonets/graft init` works the same way.
 
 ---
 
@@ -155,7 +167,9 @@ _Summary, sources, links, and notes ship today in markdown nodes. The crux ships
 - **Through your provider key:** the LLM-written parts — `graft build --deep` adds the concept nodes (file summaries + node synthesis) and the per-symbol summaries and cruxes. graft is vendor-neutral: set `GRAFT_PROVIDER` (`openai` for any OpenAI-compatible endpoint, or `anthropic` for the native API), your `GRAFT_API_KEY`, `GRAFT_MODEL`, and — for the `openai` wire format — `GRAFT_BASE_URL` to point at OpenRouter, Fireworks, Groq, a LiteLLM proxy, a local server, or OpenAI itself. Or pass `--provider/--model/--api-key/--base-url` on the command line. (`OPENROUTER_API_KEY` still works as a deprecated fallback.)
 - **No telemetry** and no analytics — the only network calls are the LLM requests you configured.
 
-See [`.env.example`](.env.example) for the full list of settings (model, base URL, graph directory).
+See [`.env.example`](.env.example) for the full list of settings. Graft deliberately
+does not auto-load repository `.env` files: export trusted values in your shell or
+pass the explicit CLI flags before using `--deep`.
 
 ---
 
@@ -164,7 +178,7 @@ See [`.env.example`](.env.example) for the full list of settings (model, base UR
 One command wires Graft into the coding agents you use:
 
 ```bash
-npx @nanonets/graft init
+graft init
 # detects your agents and writes each one's native instruction file;
 # Claude Code additionally gets the live statusline + hooks below
 ```
@@ -175,7 +189,7 @@ With no TTY to prompt on — CI, a Dockerfile, a piped shell — `init` writes *
 
 | Flag | Effect |
 |---|---|
-| `--agents <ids...>` | wire only these, no prompt — ids: `agents`, `cursor`, `gemini`, `copilot`, `kiro`, `windsurf`, `adal`, `claude` |
+| `--agents <ids...>` | wire only these, no prompt — ids: `agents`, `cursor`, `antigravity`, `gemini`, `copilot`, `kiro`, `windsurf`, `adal`, `claude` |
 | `--yes`, `-y` | skip the prompt and wire every **detected** agent |
 | `--dry-run` | print every file `init` would touch, then exit without writing |
 | `--all-agents` | write instruction files for every known agent, detected or not |
@@ -213,7 +227,7 @@ Both configs are user-level, so they apply to **every** repo you open with Codex
 Register it by hand if your agent needs it explicit:
 
 ```json
-{ "mcpServers": { "graft": { "command": "npx", "args": ["-y", "@nanonets/graft", "mcp"] } } }
+{ "mcpServers": { "graft": { "command": "graft", "args": ["mcp"] } } }
 ```
 
 Where a CLI agent supports user-level `hooks.json`, `init` also installs Graft's post-edit hook — blast-radius warnings and automatic `$0` graph re-sync after edits (skip with `--no-hooks`).
@@ -273,15 +287,15 @@ graft viz --port 5000 --no-open      # pick a port; don't auto-open the browser
 
 graft init [dir]                     # pick which agents to wire (prompts on a terminal; writes nothing until you choose)
 graft init --dry-run                 # list every file it would touch, then exit
-graft init --agents cursor kiro      # wire only these agents, no prompt (ids: agents, cursor, gemini, copilot, kiro, windsurf, adal, claude)
+graft init --agents cursor kiro      # wire only these agents, no prompt (ids: agents, cursor, antigravity, gemini, copilot, kiro, windsurf, adal, claude)
 graft init --yes                     # no prompt; wire every detected agent
 graft init --no-global               # skip writes outside this repo (~/.codex/ config + hooks)
 graft init --no-build                # wire the files only; don't build the graph
 graft init --all-agents              # wire every known agent, detected or not
 graft init --list-agents             # list known agent ids and exit
 
-graft version                        # print the installed + latest published npm version
-graft upgrade                        # npm install -g the latest published version
+graft version                        # installed version; checks npm only outside Termux
+graft upgrade                        # registry upgrade (disabled on Termux)
 
 # global
 graft --dir <path>                   # use a context dir other than <repo>/graft

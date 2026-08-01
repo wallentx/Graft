@@ -11,6 +11,14 @@ import { fileURLToPath } from "node:url";
 
 const PKG_NAME = "@nanonets/graft";
 
+/** Native Android or a Termux userspace. Injectable arguments keep tests local. */
+export function isTermuxEnvironment(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return platform === "android" || Boolean(env.TERMUX_VERSION) || env.PREFIX?.includes("com.termux") === true;
+}
+
 /** Locates package.json relative to a module URL (works for both `dist/cli.js`
  * running one level under the published package root, and `src/cli.ts` running
  * one level under the repo root via tsx). */
@@ -28,12 +36,6 @@ export function readCurrentVersion(moduleUrl: string): string {
   const raw = readFileSync(resolvePackageJsonPath(moduleUrl), "utf8");
   const pkg = JSON.parse(raw) as { version?: string };
   return pkg.version ?? "0.0.0";
-}
-
-/** True when the running module lives under an npx cache dir (e.g.
- * `~/.npm/_npx/<hash>/node_modules/...`) rather than a regular global install. */
-export function isRunningViaNpx(moduleUrl: string): boolean {
-  return fileURLToPath(moduleUrl).includes("/_npx/");
 }
 
 export interface NpmViewResult {
@@ -103,10 +105,10 @@ export function readGlobalInstalledVersion(pkgName: string = PKG_NAME): string |
 }
 
 export interface UpgradeResult {
-  /** True when `npm install -g` actually ran (false for the npx no-op path). */
+  /** True when `npm install -g` actually ran. */
   ran: boolean;
   ok: boolean;
-  /** Present when ran=true and the install failed. */
+  /** Present when the install failed or was blocked before execution. */
   errorMessage?: string;
   oldVersion?: string;
   newVersion?: string;
@@ -115,10 +117,7 @@ export interface UpgradeResult {
 /** Pure formatter for a finished upgrade — no I/O, easy to unit-test. */
 export function formatUpgradeReport(result: UpgradeResult): string {
   if (!result.ran) {
-    return (
-      "running via npx — npx already fetches the latest graft on every run.\n" +
-      "For a permanent install: npm install -g @nanonets/graft"
-    );
+    return result.errorMessage ? `✗ ${result.errorMessage}` : "upgrade not run";
   }
   if (!result.ok) {
     return `✗ npm install -g ${PKG_NAME}@latest failed${result.errorMessage ? `: ${result.errorMessage}` : ""}`;
@@ -128,11 +127,16 @@ export function formatUpgradeReport(result: UpgradeResult): string {
 
 /** Runs `npm install -g @nanonets/graft@latest` (inheriting stdio so the user
  * sees npm's own progress/errors), then re-reads the freshly installed
- * version. No-ops with guidance when running via npx. */
+ * version. */
 export function runUpgrade(moduleUrl: string): UpgradeResult {
   const oldVersion = readCurrentVersion(moduleUrl);
-  if (isRunningViaNpx(moduleUrl)) {
-    return { ran: false, ok: true, oldVersion };
+  if (isTermuxEnvironment()) {
+    return {
+      ran: false,
+      ok: false,
+      oldVersion,
+      errorMessage: "registry self-upgrade is disabled on Termux; update from the Termux-compatible checkout",
+    };
   }
   const res = spawnSync("npm", ["install", "-g", `${PKG_NAME}@latest`], { stdio: "inherit" });
   if (res.error || (res.status ?? 1) !== 0) {

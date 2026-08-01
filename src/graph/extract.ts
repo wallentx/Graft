@@ -1,3 +1,5 @@
+/// <reference types="tree-sitter-runtime" />
+
 /**
  * Tier-1 extraction: source file → {@link NodeV1}[] + raw edges, via tree-sitter.
  *
@@ -6,7 +8,11 @@
  * arrow-function consts) plus unresolved edge intents. Edge *targets* are
  * resolved against the whole-repo node index later, in build.ts.
  */
-import Parser from "tree-sitter";
+// The npm alias keeps optional grammar peers from forcing the runtime back to
+// 0.21. Its declarations retain the upstream `tree-sitter` module name.
+// @ts-expect-error The runtime alias intentionally differs from that type name.
+import ParserRuntime from "tree-sitter-runtime";
+import type Parser from "tree-sitter";
 import TypeScript from "tree-sitter-typescript";
 import Python from "tree-sitter-python";
 import Go from "tree-sitter-go";
@@ -125,7 +131,7 @@ const FUNCTION_VALUE_TYPES = new Set([
   "generator_function",
 ]);
 
-const parser = new Parser();
+const parser = new ParserRuntime();
 const GRAMMARS: Record<Language, unknown> = {
   typescript: TypeScript.typescript,
   tsx: TypeScript.tsx,
