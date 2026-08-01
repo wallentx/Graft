@@ -1,5 +1,6 @@
 node_modules/
 dist/
+rust/target/
 *.log
 
 # graft's local graph cache — regenerable, not committed. Each dev runs
