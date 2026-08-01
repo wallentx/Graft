@@ -1,0 +1,281 @@
+//! Tier-1 extraction: source text -> symbols + unresolved call intents.
+//!
+//! Mirrors the TypeScript implementation's split. Symbols are found per file;
+//! call *targets* are deliberately left unresolved here, because a callee named
+//! in one file is usually defined in another. Resolution happens once the whole
+//! repo's symbols are known — see `resolve_edges`.
+//!
+//! Extraction is query-driven rather than a hand-rolled walk: a tree-sitter query
+//! states which shapes are definitions, so adding a language means adding a query
+//! rather than another arm in a recursive match.
+
+use anyhow::{Context, Result};
+use std::collections::HashMap;
+use streaming_iterator::StreamingIterator;
+use tree_sitter::{Node, Parser, Query, QueryCursor};
+
+use crate::repo::Lang;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Symbol {
+    pub name: String,
+    pub kind: String,
+    pub start_line: i64,
+    pub end_line: i64,
+    pub signature: String,
+}
+
+/// A call site whose target is a bare name, not yet tied to a symbol row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallIntent {
+    /// Index into the file's symbol list — the symbol the call appears inside.
+    pub from: usize,
+    pub callee: String,
+}
+
+pub struct Extracted {
+    pub symbols: Vec<Symbol>,
+    pub calls: Vec<CallIntent>,
+}
+
+/// Definition shapes. `@name` is the identifier stored; the outer capture is the
+/// span. Order matters only for readability — matches are keyed by capture name.
+const TS_DEFS: &str = r#"
+(function_declaration name: (identifier) @name) @def
+(generator_function_declaration name: (identifier) @name) @def
+(class_declaration name: (type_identifier) @name) @def
+(interface_declaration name: (type_identifier) @name) @def
+(type_alias_declaration name: (type_identifier) @name) @def
+(enum_declaration name: (identifier) @name) @def
+(method_definition name: (property_identifier) @name) @def
+(public_field_definition name: (property_identifier) @name
+  value: [(arrow_function) (function_expression)]) @def
+(variable_declarator
+  name: (identifier) @name
+  value: [(arrow_function) (function_expression) (generator_function)]) @def
+"#;
+
+/// Call sites. `foo()` and `obj.foo()` both record the bare callee name, which is
+/// what the repo-wide index is keyed on.
+const TS_CALLS: &str = r#"
+(call_expression function: (identifier) @callee)
+(call_expression function: (member_expression property: (property_identifier) @callee))
+(new_expression constructor: (identifier) @callee)
+"#;
+
+fn language(lang: Lang) -> tree_sitter::Language {
+    match lang {
+        Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+    }
+}
+
+/// A node's kind, mapped to the vocabulary stored in `symbols.kind`.
+fn kind_of(n: &Node) -> &'static str {
+    match n.kind() {
+        "class_declaration" => "class",
+        "interface_declaration" => "interface",
+        "type_alias_declaration" => "type",
+        "enum_declaration" => "enum",
+        "method_definition" => "method",
+        _ => "function",
+    }
+}
+
+/// First line of the definition, trimmed — enough to identify a symbol without
+/// storing its body. Cheap stand-in for the TypeScript implementation's richer
+/// signature rendering; it is what `grep` and `skeleton` display.
+fn signature_of(src: &str, n: &Node) -> String {
+    let text = &src[n.byte_range()];
+    let line = text.lines().next().unwrap_or("").trim();
+    let line = line.strip_suffix('{').unwrap_or(line).trim_end();
+    let mut s = line.to_string();
+    if s.len() > 200 {
+        s.truncate(200);
+        s.push('…');
+    }
+    s
+}
+
+pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
+    let ts_lang = language(lang);
+    let mut parser = Parser::new();
+    parser.set_language(&ts_lang).context("set_language")?;
+    let tree = parser.parse(src, None).context("parse returned no tree")?;
+    let root = tree.root_node();
+
+    let def_q = Query::new(&ts_lang, TS_DEFS).context("compile definition query")?;
+    let name_idx = def_q
+        .capture_index_for_name("name")
+        .context("query lacks @name")?;
+    let def_idx = def_q
+        .capture_index_for_name("def")
+        .context("query lacks @def")?;
+
+    let mut symbols: Vec<Symbol> = Vec::new();
+    // Byte span of each symbol, kept parallel to `symbols`, so a call site can be
+    // attributed to the innermost definition containing it.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+
+    let mut cursor = QueryCursor::new();
+    let mut it = cursor.matches(&def_q, root, src.as_bytes());
+    while let Some(m) = it.next() {
+        let name_node = m.captures.iter().find(|c| c.index == name_idx).map(|c| c.node);
+        let def_node = m.captures.iter().find(|c| c.index == def_idx).map(|c| c.node);
+        let (Some(name_node), Some(def_node)) = (name_node, def_node) else {
+            continue;
+        };
+        symbols.push(Symbol {
+            name: src[name_node.byte_range()].to_string(),
+            kind: kind_of(&def_node).to_string(),
+            // tree-sitter rows are 0-based; every display surface is 1-based.
+            start_line: def_node.start_position().row as i64 + 1,
+            end_line: def_node.end_position().row as i64 + 1,
+            signature: signature_of(src, &def_node),
+        });
+        spans.push((def_node.start_byte(), def_node.end_byte()));
+    }
+
+    let call_q = Query::new(&ts_lang, TS_CALLS).context("compile call query")?;
+    let mut calls = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut it = cursor.matches(&call_q, root, src.as_bytes());
+    while let Some(m) = it.next() {
+        for c in m.captures {
+            let at = c.node.start_byte();
+            // Innermost enclosing definition: the narrowest span containing the
+            // call. Without "narrowest", a method's calls would be credited to the
+            // class that encloses it.
+            let owner = spans
+                .iter()
+                .enumerate()
+                .filter(|(_, (s, e))| *s <= at && at < *e)
+                .min_by_key(|(_, (s, e))| e - s)
+                .map(|(i, _)| i);
+            let Some(from) = owner else { continue }; // top-level call: no caller
+            calls.push(CallIntent {
+                from,
+                callee: src[c.node.byte_range()].to_string(),
+            });
+        }
+    }
+
+    Ok(Extracted { symbols, calls })
+}
+
+/// Resolve bare callee names against the whole-repo symbol index.
+///
+/// Ambiguity is dropped, not guessed: a name defined in more than one file cannot
+/// be attributed to one of them from a bare call site, and inventing an edge is
+/// worse than omitting one — `callers` is used to decide what a change breaks.
+pub fn resolve(
+    by_name: &HashMap<String, Vec<i64>>,
+    from_id: i64,
+    callee: &str,
+) -> Option<i64> {
+    match by_name.get(callee)?.as_slice() {
+        [only] => Some(*only),
+        // Self-recursion resolves even when the name is ambiguous repo-wide.
+        many if many.contains(&from_id) => Some(from_id),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(src: &str) -> Vec<(String, String)> {
+        extract(Lang::TypeScript, src)
+            .unwrap()
+            .symbols
+            .into_iter()
+            .map(|s| (s.name, s.kind))
+            .collect()
+    }
+
+    #[test]
+    fn finds_the_definition_shapes_typescript_actually_uses() {
+        let src = r#"
+export function greet(name: string): string { return `hi ${name}`; }
+export const shout = (s: string) => s.toUpperCase();
+export class Repo {
+  scan(): void {}
+}
+export interface Node { id: string }
+export type Id = string;
+enum Color { Red }
+"#;
+        let got = names(src);
+        for want in [
+            ("greet", "function"),
+            ("shout", "function"),
+            ("Repo", "class"),
+            ("scan", "method"),
+            ("Node", "interface"),
+            ("Id", "type"),
+            ("Color", "enum"),
+        ] {
+            assert!(
+                got.contains(&(want.0.to_string(), want.1.to_string())),
+                "missing {want:?} in {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_const_is_not_a_symbol() {
+        // Only function-valued declarators are definitions; indexing every const
+        // would bury real symbols under configuration and string literals.
+        let got = names("const MAX = 10; const cfg = { a: 1 };");
+        assert!(got.is_empty(), "expected no symbols, got {got:?}");
+    }
+
+    #[test]
+    fn lines_are_one_based() {
+        let e = extract(Lang::TypeScript, "\n\nfunction f() {}\n").unwrap();
+        assert_eq!(e.symbols[0].start_line, 3, "tree-sitter rows are 0-based; storage is 1-based");
+    }
+
+    #[test]
+    fn calls_are_credited_to_the_innermost_definition() {
+        let src = r#"
+class Service {
+  run(): void { helper(); }
+}
+function helper(): void {}
+"#;
+        let e = extract(Lang::TypeScript, src).unwrap();
+        let run = e.symbols.iter().position(|s| s.name == "run").unwrap();
+        let call = e.calls.iter().find(|c| c.callee == "helper").expect("call not found");
+        assert_eq!(
+            call.from, run,
+            "the call belongs to run(), not to the enclosing class"
+        );
+    }
+
+    #[test]
+    fn method_calls_record_the_bare_property_name() {
+        let e = extract(Lang::TypeScript, "function f() { repo.scan(); }").unwrap();
+        assert!(e.calls.iter().any(|c| c.callee == "scan"), "{:?}", e.calls);
+    }
+
+    #[test]
+    fn resolve_refuses_to_guess_between_duplicates() {
+        let mut idx = HashMap::new();
+        idx.insert("unique".to_string(), vec![7]);
+        idx.insert("dup".to_string(), vec![1, 2]);
+        assert_eq!(resolve(&idx, 99, "unique"), Some(7));
+        assert_eq!(resolve(&idx, 99, "dup"), None, "an invented edge is worse than a missing one");
+        assert_eq!(resolve(&idx, 99, "absent"), None);
+        // …except recursion, where the caller is itself a candidate.
+        assert_eq!(resolve(&idx, 2, "dup"), Some(2));
+    }
+
+    #[test]
+    fn tsx_parses_as_its_own_dialect() {
+        let e = extract(Lang::Tsx, "const App = () => <div>hi</div>;").unwrap();
+        assert_eq!(e.symbols.len(), 1);
+        assert_eq!(e.symbols[0].name, "App");
+    }
+}

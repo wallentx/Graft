@@ -1,127 +1,160 @@
-//! Toolchain spike — NOT the real CLI.
+//! `graft` — the Rust port, in progress.
 //!
-//! Proves the three native dependencies the rewrite rests on actually build and
-//! run on this device (Termux, aarch64) before any real code is written against
-//! them. Every install problem this fork has hit so far has been native-toolchain
-//! packaging, so this is the risk worth retiring first.
-//!
-//! Checks, in order:
-//!   1. bundled SQLite opens, and FTS5 is compiled in (the `ask`/`grep` index
-//!      depends on it — rusqlite's `bundled` feature is only useful here if FTS5
-//!      came along).
-//!   2. WAL mode engages (a reader can query while a build writes).
-//!   3. Each tree-sitter grammar parses a snippet of its language.
+//! Nothing is written into an indexed repository. The graph lives in one SQLite
+//! store outside every work tree; a repo is identified by the realpath of its git
+//! toplevel. A directory graft has never indexed is reported as such rather than
+//! answered from an empty graph.
 
 mod db;
+mod extract;
+mod index;
+mod repo;
 
-use anyhow::{Context, Result};
-use rusqlite::Connection;
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
-fn check_sqlite() -> Result<()> {
-    // File-backed, not `:memory:` — an in-memory database silently reports
-    // `memory` for `journal_mode=wal`, which reads like a pass and proves nothing.
-    // WAL is what lets the MCP server query while a build is writing, so it has to
-    // be checked against a real file on this filesystem.
-    let dir = std::env::temp_dir().join("graft-spike");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("spike.db");
-    let _ = std::fs::remove_file(&path);
-    let db = Connection::open(&path).with_context(|| format!("open {}", path.display()))?;
-
-    let version: String = db.query_row("select sqlite_version()", [], |r| r.get(0))?;
-    println!("  sqlite      {version}");
-
-    let mode: String = db.query_row("pragma journal_mode=wal", [], |r| r.get(0))?;
-    anyhow::ensure!(
-        mode.eq_ignore_ascii_case("wal"),
-        "journal_mode came back {mode:?}, not wal — this filesystem may not support \
-         the shared memory WAL needs (Android/Termux storage is worth suspecting)"
-    );
-    println!("  journal     {mode}");
-
-    // A second connection must be able to read while the first holds a write txn.
-    db.execute_batch("create table t(x); begin; insert into t values (1);")?;
-    let reader = Connection::open(&path).context("second connection")?;
-    let n: i64 = reader
-        .query_row("select count(*) from t", [], |r| r.get(0))
-        .context("concurrent read during an open write txn")?;
-    db.execute_batch("commit")?;
-    println!("  concurrency reader saw {n} row(s) mid-write (pre-commit snapshot)");
-
-    db.execute_batch(
-        "create virtual table symbols_fts using fts5(name, signature, summary);
-         insert into symbols_fts values
-           ('parseRepo', 'fn parseRepo(p: Path)', 'walks the tree and extracts symbols'),
-           ('renderCard', 'fn renderCard(n: Node)', 'projects a node to markdown');",
-    )
-    .context("create fts5 table — bundled sqlite may lack SQLITE_ENABLE_FTS5")?;
-
-    let mut stmt =
-        db.prepare("select name, rank from symbols_fts where symbols_fts match ?1 order by rank")?;
-    let hits: Vec<(String, f64)> = stmt
-        .query_map(["parse*"], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<Result<_, _>>()?;
-    println!("  fts5        available, ranked hits: {hits:?}");
-
-    Ok(())
+#[derive(Parser)]
+#[command(name = "graft", about = "Repo context graph, stored outside the repo")]
+struct Cli {
+    /// Store to use. Defaults to $XDG_DATA_HOME/graft/graft.db.
+    #[arg(long, global = true)]
+    store: Option<PathBuf>,
+    #[command(subcommand)]
+    cmd: Cmd,
 }
 
-fn check_grammars() -> Result<()> {
-    let cases: [(&str, tree_sitter::Language, &str); 4] = [
-        (
-            "typescript",
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            "export function greet(name: string): string { return `hi ${name}`; }",
-        ),
-        (
-            "tsx",
-            tree_sitter_typescript::LANGUAGE_TSX.into(),
-            "const App = () => <div className=\"x\">hi</div>;",
-        ),
-        (
-            "python",
-            tree_sitter_python::LANGUAGE.into(),
-            "def greet(name: str) -> str:\n    return f'hi {name}'\n",
-        ),
-        (
-            "go",
-            tree_sitter_go::LANGUAGE.into(),
-            "package main\nfunc Greet(name string) string { return \"hi \" + name }\n",
-        ),
-    ];
+#[derive(Subcommand)]
+enum Cmd {
+    /// Index a repo into the store.
+    Build {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Find every symbol whose name or signature contains a literal.
+    Grep {
+        pattern: String,
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
+    /// Report what the store knows about a repo.
+    Status {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+}
 
-    for (label, lang, src) in cases {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&lang)
-            .with_context(|| format!("set_language for {label}"))?;
-        let tree = parser
-            .parse(src, None)
-            .with_context(|| format!("parse {label}"))?;
-        let root = tree.root_node();
-        anyhow::ensure!(!root.has_error(), "{label}: parse tree has an ERROR node");
-        println!(
-            "  {label:<11} ok — root={} children={}",
-            root.kind(),
-            root.child_count()
-        );
-    }
-
-    Ok(())
+/// The one message a caller sees for an unindexed directory. Every read path
+/// routes through here so the instruction is identical wherever it surfaces —
+/// including, later, the MCP server.
+fn not_indexed(root: &std::path::Path) -> String {
+    format!(
+        "{} has not been indexed by graft — run `graft build` to index it",
+        root.display()
+    )
 }
 
 fn main() -> Result<()> {
-    println!(
-        "graft rust spike — v{} on {}",
-        env!("CARGO_PKG_VERSION"),
-        std::env::consts::ARCH
-    );
-    println!("sqlite:");
-    check_sqlite()?;
-    println!("grammars:");
-    check_grammars()?;
-    println!("store:");
-    println!("  default     {}", db::default_path()?.display());
-    println!("\nall native dependencies build and run here.");
+    // Rust ignores SIGPIPE, so `graft grep x | head` panics on the first write
+    // past the closed pipe instead of exiting quietly the way every other CLI
+    // does. Restoring the default disposition makes piping behave.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
+    let cli = Cli::parse();
+    let store = match cli.store {
+        Some(p) => p,
+        None => db::default_path()?,
+    };
+
+    match cli.cmd {
+        Cmd::Build { path } => {
+            let root = repo::root_of(&path)?;
+            let mut conn = db::open(&store)?;
+            let t0 = std::time::Instant::now();
+            let s = index::build(&mut conn, &root)?;
+            println!(
+                "indexed {} — {} files, {} symbols, {} edges ({} unresolved) in {:.2}s",
+                root.display(),
+                s.files,
+                s.symbols,
+                s.edges,
+                s.unresolved,
+                t0.elapsed().as_secs_f64()
+            );
+            println!("store: {}", store.display());
+        }
+
+        Cmd::Grep { pattern, path } => {
+            let root = repo::root_of(&path)?;
+            let conn = db::open(&store)?;
+            let Some(repo_id) = index::repo_id_of(&conn, &root)? else {
+                eprintln!("{}", not_indexed(&root));
+                std::process::exit(2);
+            };
+            let r = index::grep(&conn, repo_id, &root, &pattern)?;
+            if r.total_hits == 0 {
+                println!(
+                    "no hits for {pattern:?} in {} indexed files",
+                    r.files_searched
+                );
+                return Ok(());
+            }
+            println!(
+                "{pattern:?} — {} hits in {} symbols across {} files (searched {} indexed files)",
+                r.total_hits,
+                r.groups.len(),
+                r.groups.iter().map(|g| &g.path).collect::<std::collections::HashSet<_>>().len(),
+                r.files_searched
+            );
+            for g in &r.groups {
+                match &g.symbol {
+                    Some(name) => println!(
+                        "\n{name} · {} · {}:L{}-L{} · {} in-edges",
+                        g.kind, g.path, g.start_line, g.end_line, g.in_edges
+                    ),
+                    None => println!("\n{} · file scope", g.path),
+                }
+                for h in &g.hits {
+                    println!("  L{}: {}", h.line, h.text);
+                }
+            }
+            if r.unreadable > 0 {
+                eprintln!("\n{} indexed file(s) could not be read", r.unreadable);
+            }
+        }
+
+        Cmd::Status { path } => {
+            let root = repo::root_of(&path)?;
+            let conn = db::open(&store)?;
+            match index::repo_id_of(&conn, &root)? {
+                None => {
+                    eprintln!("{}", not_indexed(&root));
+                    std::process::exit(2);
+                }
+                Some(id) => {
+                    let (files, syms, edges): (i64, i64, i64) = conn.query_row(
+                        "select (select count(*) from files   where repo_id=?1),
+                                (select count(*) from symbols where repo_id=?1),
+                                (select count(*) from edges   where repo_id=?1)",
+                        [id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )?;
+                    let stamp: String =
+                        conn.query_row("select extractor_stamp from repos where id=?1", [id], |r| {
+                            r.get(0)
+                        })?;
+                    println!("{}", root.display());
+                    println!("  files    {files}");
+                    println!("  symbols  {syms}");
+                    println!("  edges    {edges}");
+                    println!("  stamp    {stamp}");
+                    println!("  store    {}", store.display());
+                }
+            }
+        }
+    }
     Ok(())
 }
