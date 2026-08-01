@@ -49,6 +49,17 @@ enum Cmd {
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
+    /// Every signature in one file.
+    Skeleton {
+        file: PathBuf,
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
+    /// Orientation: directory clusters, hubs, hotspots.
+    Map {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Report what the store knows about a repo.
     Status {
         #[arg(default_value = ".")]
@@ -164,6 +175,61 @@ fn main() -> Result<()> {
                     "  {} {} {} ({}:L{}-L{}) [depth {}]",
                     r.edge, arrow, r.name, r.path, r.start_line, r.end_line, r.depth
                 );
+            }
+        }
+
+        Cmd::Skeleton { file, path } => {
+            let root = repo::root_of(&path)?;
+            let conn = db::open(&store)?;
+            let Some(repo_id) = index::repo_id_of(&conn, &root)? else {
+                eprintln!("{}", not_indexed(&root));
+                std::process::exit(2);
+            };
+            // Accept either a repo-relative path or one the shell completed.
+            let abs = std::fs::canonicalize(&file).unwrap_or_else(|_| root.join(&file));
+            let rel = abs.strip_prefix(&root).unwrap_or(&file).to_string_lossy().replace('\\', "/");
+            let rows = index::skeleton(&conn, repo_id, &rel)?;
+            if rows.is_empty() {
+                eprintln!("no indexed symbols in {rel} — is it indexed, and a language graft reads?");
+                std::process::exit(2);
+            }
+            println!("graft skeleton — {rel}");
+            for r in &rows {
+                let owner = r.container.as_deref().map(|c| format!("{c}.")).unwrap_or_default();
+                println!("- L{}-L{}  {} {}{}  {}", r.start_line, r.end_line, r.kind, owner, r.name, r.signature);
+            }
+        }
+
+        Cmd::Map { path } => {
+            let root = repo::root_of(&path)?;
+            let conn = db::open(&store)?;
+            let Some(repo_id) = index::repo_id_of(&conn, &root)? else {
+                eprintln!("{}", not_indexed(&root));
+                std::process::exit(2);
+            };
+            let m = index::repo_map(&conn, repo_id, 12)?;
+            println!("repo map — {} files · {} symbols · {} edges", m.files, m.symbols, m.edges);
+            println!();
+            for d in &m.dirs {
+                let hubs = d
+                    .hubs
+                    .iter()
+                    .map(|h| {
+                        let base = h.path.rsplit('/').next().unwrap_or(&h.path);
+                        format!("{} ({}, {}←)", h.name, base, h.in_degree)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let tail = if hubs.is_empty() { String::new() } else { format!("   hubs: {hubs}") };
+                println!("{:<18}{} files · {} symbols{}", d.dir, d.files, d.symbols, tail);
+            }
+            if !m.hotspots.is_empty() {
+                println!();
+                print!("hotspots:");
+                for h in &m.hotspots {
+                    print!("  {} · {} · {}:L{}-L{} · {}←", h.name, h.kind, h.path, h.start_line, h.end_line, h.in_degree);
+                }
+                println!();
             }
         }
 

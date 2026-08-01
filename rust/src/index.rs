@@ -222,6 +222,15 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
                 }
             }
 
+            // A member call whose receiver type is unknown resolves to nothing.
+            // Falling through to bare-name matching attributes every `arr.push()`
+            // in the repo to a local function that happens to be named `push` —
+            // which is how `push` came out as the top hub with 82 in-edges.
+            if c.receiver.is_some() {
+                unresolved += 1;
+                continue;
+            }
+
             match extract::resolve(&by_name, from_id, &c.callee) {
                 Some(to_id) => {
                     // OR IGNORE: repeated calls between the same pair collapse to
@@ -580,4 +589,144 @@ pub fn callers(
         frontier = next;
     }
     Ok((seeds, reached))
+}
+
+pub struct SkelRow {
+    pub name: String,
+    pub kind: String,
+    pub start_line: i64,
+    pub end_line: i64,
+    pub signature: String,
+    pub container: Option<String>,
+}
+
+/// Every signature in one file, ordered as they appear.
+///
+/// Excludes the synthetic file node itself: the caller already named the file, and
+/// listing it as a member of itself is noise.
+pub fn skeleton(db: &Connection, repo_id: i64, rel: &str) -> Result<Vec<SkelRow>> {
+    let mut stmt = db.prepare(
+        "select s.name, s.kind, s.start_line, s.end_line, coalesce(s.signature,''), s.container
+           from symbols s join files f on f.id = s.file_id
+          where s.repo_id = ?1 and f.path = ?2 and s.kind not in ('file','module')
+          order by s.start_line, s.end_line desc",
+    )?;
+    Ok(stmt
+        .query_map(rusqlite::params![repo_id, rel], |r| {
+            Ok(SkelRow {
+                name: r.get(0)?,
+                kind: r.get(1)?,
+                start_line: r.get(2)?,
+                end_line: r.get(3)?,
+                signature: r.get(4)?,
+                container: r.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+pub struct Hub {
+    pub name: String,
+    pub kind: String,
+    pub path: String,
+    pub start_line: i64,
+    pub end_line: i64,
+    pub in_degree: i64,
+}
+
+pub struct DirEntry {
+    pub dir: String,
+    pub files: i64,
+    pub symbols: i64,
+    pub hubs: Vec<Hub>,
+}
+
+pub struct RepoMap {
+    pub files: i64,
+    pub symbols: i64,
+    pub edges: i64,
+    pub dirs: Vec<DirEntry>,
+    pub hotspots: Vec<Hub>,
+}
+
+/// In-degree over `calls` edges only. Containment would rank every symbol at
+/// exactly 1 and imports would rank files, neither of which says "many things
+/// depend on this" — which is the question a hub answers.
+const HUB_SQL: &str = "select s.name, s.kind, f.path, s.start_line, s.end_line,
+        (select count(*) from edges e
+          where e.dst_symbol_id = s.id and e.kind = 'calls') d
+   from symbols s join files f on f.id = s.file_id
+  where s.repo_id = ?1 and s.kind not in ('file','module')";
+
+fn read_hubs(stmt: &mut rusqlite::Statement, repo_id: i64) -> Result<Vec<Hub>> {
+    Ok(stmt
+        .query_map([repo_id], |r| {
+            Ok(Hub {
+                name: r.get(0)?,
+                kind: r.get(1)?,
+                path: r.get(2)?,
+                start_line: r.get(3)?,
+                end_line: r.get(4)?,
+                in_degree: r.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Orientation for an unfamiliar repo: directory clusters, their hubs, and the
+/// most-depended-on symbols overall.
+pub fn repo_map(db: &Connection, repo_id: i64, top: usize) -> Result<RepoMap> {
+    let (files, symbols, edges): (i64, i64, i64) = db.query_row(
+        "select (select count(*) from files where repo_id=?1),
+                (select count(*) from symbols where repo_id=?1 and kind not in ('file','module')),
+                (select count(*) from edges where repo_id=?1)",
+        [repo_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+
+    let mut stmt = db.prepare(&format!("{HUB_SQL} order by d desc, s.name"))?;
+    let all = read_hubs(&mut stmt, repo_id)?;
+
+    // Top-level directory, or "." for a file at the root.
+    let bucket = |p: &str| -> String {
+        match p.split_once('/') {
+            Some((head, _)) => format!("{head}/"),
+            None => ".".to_string(),
+        }
+    };
+
+    let mut per_dir: HashMap<String, (std::collections::HashSet<String>, i64, Vec<&Hub>)> =
+        HashMap::new();
+    for h in &all {
+        let e = per_dir.entry(bucket(&h.path)).or_default();
+        e.0.insert(h.path.clone());
+        e.1 += 1;
+        if h.in_degree > 0 && e.2.len() < 3 {
+            e.2.push(h);
+        }
+    }
+
+    let mut dirs: Vec<DirEntry> = per_dir
+        .into_iter()
+        .map(|(dir, (fs, n, hubs))| DirEntry {
+            dir,
+            files: fs.len() as i64,
+            symbols: n,
+            hubs: hubs
+                .into_iter()
+                .map(|h| Hub {
+                    name: h.name.clone(),
+                    kind: h.kind.clone(),
+                    path: h.path.clone(),
+                    start_line: h.start_line,
+                    end_line: h.end_line,
+                    in_degree: h.in_degree,
+                })
+                .collect(),
+        })
+        .collect();
+    dirs.sort_by(|a, b| b.symbols.cmp(&a.symbols).then_with(|| a.dir.cmp(&b.dir)));
+
+    let hotspots = all.into_iter().filter(|h| h.in_degree > 0).take(top).collect();
+    Ok(RepoMap { files, symbols, edges, dirs, hotspots })
 }
