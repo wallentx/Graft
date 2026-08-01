@@ -58,8 +58,10 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
 
     // Pass 1: symbols. Call targets cannot be resolved until every file's symbols
     // exist, because a callee is usually defined somewhere else.
-    let mut pending: Vec<(Vec<i64>, Vec<extract::CallIntent>)> = Vec::new();
+    let mut pending: Vec<(Vec<i64>, extract::Extracted)> = Vec::new();
     let mut by_name: HashMap<String, Vec<i64>> = HashMap::new();
+    // (class, method) -> ids. What a receiver-typed call resolves against.
+    let mut by_container: HashMap<(String, String), Vec<i64>> = HashMap::new();
     let mut n_symbols = 0usize;
 
     for f in &files {
@@ -70,34 +72,86 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
             Err(_) => continue,
         };
         let mut ids = Vec::with_capacity(ex.symbols.len());
-        for s in &ex.symbols {
+        for (i, s) in ex.symbols.iter().enumerate() {
+            let container = ex.containers.get(i).cloned().flatten();
             tx.execute(
-                "insert into symbols(repo_id, file_id, name, kind, start_line, end_line, signature)
-                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![repo_id, file_id, s.name, s.kind, s.start_line, s.end_line, s.signature],
+                "insert into symbols(repo_id, file_id, name, kind, start_line, end_line, signature, container)
+                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![repo_id, file_id, s.name, s.kind, s.start_line, s.end_line, s.signature, container],
             )?;
             let id = tx.last_insert_rowid();
             ids.push(id);
             by_name.entry(s.name.clone()).or_default().push(id);
+            if let Some(c) = container {
+                by_container.entry((c, s.name.clone())).or_default().push(id);
+            }
             n_symbols += 1;
         }
-        pending.push((ids, ex.calls));
+        pending.push((ids, ex));
     }
 
     // Pass 2: resolve call intents against the now-complete repo-wide index.
     let mut n_edges = 0usize;
     let mut unresolved = 0usize;
-    for (ids, calls) in &pending {
-        for c in calls {
+    for (ids, ex) in &pending {
+        // Per-file binding lookup: (scope symbol index or None, variable) -> type.
+        let mut binds: HashMap<(Option<usize>, &str), &str> = HashMap::new();
+        for b in &ex.bindings {
+            binds.insert((b.owner, b.name.as_str()), b.ty.as_str());
+        }
+
+        for c in &ex.calls {
             let Some(&from_id) = ids.get(c.from) else { continue };
+
+            // Receiver-typed resolution first: it names one class's method, where
+            // the bare name would match every same-named method in the repo and be
+            // dropped as ambiguous.
+            if let Some(recv) = &c.receiver {
+                let ty = if recv == "this" {
+                    ex.containers.get(c.from).cloned().flatten()
+                } else if let Some(field) = recv.strip_prefix("this.") {
+                    // A field binding is scoped to the class, not the method.
+                    let class = ex.containers.get(c.from).cloned().flatten();
+                    class.and_then(|cls| {
+                        ex.symbols
+                            .iter()
+                            .position(|s| s.name == cls && s.kind == "class")
+                            .and_then(|ci| {
+                                binds.get(&(Some(ci), format!("this.{field}").as_str())).copied()
+                            })
+                            .map(str::to_string)
+                    })
+                } else {
+                    // Innermost first: the enclosing definition, then module scope.
+                    // Deeper lexical nesting is not walked — a rarer shape, and
+                    // guessing past the first miss risks a wrong edge.
+                    binds
+                        .get(&(Some(c.from), recv.as_str()))
+                        .or_else(|| binds.get(&(None, recv.as_str())))
+                        .copied()
+                        .map(str::to_string)
+                };
+                if let Some(ty) = ty {
+                    if let Some([only]) = by_container.get(&(ty, c.callee.clone())).map(|v| v.as_slice()) {
+                        n_edges += tx.execute(
+                            "insert or ignore into edges(repo_id, src_symbol_id, dst_symbol_id, kind)
+                             values (?1, ?2, ?3, 'calls')",
+                            rusqlite::params![repo_id, from_id, *only],
+                        )?;
+                        continue;
+                    }
+                }
+            }
+
             match extract::resolve(&by_name, from_id, &c.callee) {
                 Some(to_id) => {
-                    tx.execute(
-                        "insert into edges(repo_id, src_symbol_id, dst_symbol_id, kind)
+                    // OR IGNORE: repeated calls between the same pair collapse to
+                    // the one edge the unique index permits.
+                    n_edges += tx.execute(
+                        "insert or ignore into edges(repo_id, src_symbol_id, dst_symbol_id, kind)
                          values (?1, ?2, ?3, 'calls')",
                         rusqlite::params![repo_id, from_id, to_id],
                     )?;
-                    n_edges += 1;
                 }
                 // Calls into node_modules, globals, and ambiguous names all land
                 // here. Counted rather than dropped silently so the number is

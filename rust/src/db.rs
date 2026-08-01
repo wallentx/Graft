@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped whenever the DDL below changes in a way an existing store cannot serve.
 /// Read from and written to `pragma user_version`.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 3;
 
 const DDL: &str = r#"
 create table if not exists repos (
@@ -57,10 +57,16 @@ create table if not exists symbols (
   end_line   integer not null,
   signature  text,
   crux       text,
-  summary    text
+  summary    text,
+  -- Enclosing class for a method, else null. This is what lets a member call
+  -- resolve: `repo.scan()` binds `repo` to type Repo, and the edge target is the
+  -- symbol named `scan` whose container is `Repo`. Without it every method named
+  -- `scan` in the repo is an equally good candidate and the edge is dropped.
+  container  text
 );
 create index if not exists symbols_by_name on symbols(repo_id, name);
 create index if not exists symbols_by_file on symbols(file_id);
+create index if not exists symbols_by_container on symbols(repo_id, container, name);
 
 create table if not exists edges (
   repo_id       integer not null references repos(id) on delete cascade,
@@ -68,6 +74,11 @@ create table if not exists edges (
   dst_symbol_id integer not null references symbols(id) on delete cascade,
   kind          text    not null
 );
+-- An edge is a relationship, not an occurrence: three calls to the same function
+-- from one caller are one edge. Without this, in-edge counts inflate and callers
+-- lists the same caller once per call site.
+create unique index if not exists edges_unique
+  on edges(repo_id, src_symbol_id, dst_symbol_id, kind);
 -- callers(x) walks dst->src; --direction out walks src->dst. Both need an index
 -- or every traversal degrades to a full scan of the repo's edge set.
 create index if not exists edges_by_dst on edges(repo_id, dst_symbol_id);

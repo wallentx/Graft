@@ -31,11 +31,26 @@ pub struct CallIntent {
     /// Index into the file's symbol list — the symbol the call appears inside.
     pub from: usize,
     pub callee: String,
+    /// Receiver text for a member call (`repo` in `repo.scan()`). None for a bare
+    /// call. This is what turns an ambiguous method name into one target.
+    pub receiver: Option<String>,
+}
+
+/// A variable, parameter or field bound to a type name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Binding {
+    /// Symbol the binding is scoped to; None at module level.
+    pub owner: Option<usize>,
+    pub name: String,
+    pub ty: String,
 }
 
 pub struct Extracted {
     pub symbols: Vec<Symbol>,
     pub calls: Vec<CallIntent>,
+    pub bindings: Vec<Binding>,
+    /// Parallel to `symbols`: the enclosing class name for a method, else None.
+    pub containers: Vec<Option<String>>,
 }
 
 /// Definition shapes. `@name` is the identifier stored; the outer capture is the
@@ -59,8 +74,26 @@ const TS_DEFS: &str = r#"
 /// what the repo-wide index is keyed on.
 const TS_CALLS: &str = r#"
 (call_expression function: (identifier) @callee)
-(call_expression function: (member_expression property: (property_identifier) @callee))
+(call_expression function: (member_expression object: (_) @recv property: (property_identifier) @callee))
 (new_expression constructor: (identifier) @callee)
+"#;
+
+/// Type bindings. Each alternative names the variable and the type it carries, so
+/// a later member call on that variable resolves to one class's method rather
+/// than to every method in the repo sharing the name.
+const TS_BINDINGS: &str = r#"
+(variable_declarator
+  name: (identifier) @name
+  value: (new_expression constructor: (identifier) @ty))
+(variable_declarator
+  name: (identifier) @name
+  type: (type_annotation (type_identifier) @ty))
+(required_parameter
+  pattern: (identifier) @name
+  type: (type_annotation (type_identifier) @ty))
+(public_field_definition
+  name: (property_identifier) @field
+  type: (type_annotation (type_identifier) @ty))
 "#;
 
 fn language(lang: Lang) -> tree_sitter::Language {
@@ -136,31 +169,100 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
         spans.push((def_node.start_byte(), def_node.end_byte()));
     }
 
+    // Innermost definition containing a byte offset. Narrowest wins, so a call in
+    // a method is credited to the method rather than to the class around it.
+    let owner_at = |at: usize| -> Option<usize> {
+        spans
+            .iter()
+            .enumerate()
+            .filter(|(_, (s, e))| *s <= at && at < *e)
+            .min_by_key(|(_, (s, e))| e - s)
+            .map(|(i, _)| i)
+    };
+    // Innermost enclosing *class*, which is what a method's container is.
+    let class_at = |at: usize| -> Option<usize> {
+        spans
+            .iter()
+            .enumerate()
+            .filter(|(i, (s, e))| *s <= at && at < *e && symbols[*i].kind == "class")
+            .min_by_key(|(_, (s, e))| e - s)
+            .map(|(i, _)| i)
+    };
+
+    let containers: Vec<Option<String>> = symbols
+        .iter()
+        .enumerate()
+        .map(|(i, sym)| {
+            if sym.kind != "method" {
+                return None;
+            }
+            // A method's own span is inside its class's span, so search from just
+            // past its start to avoid matching itself.
+            class_at(spans[i].0).map(|c| symbols[c].name.clone())
+        })
+        .collect();
+
     let call_q = Query::new(&ts_lang, TS_CALLS).context("compile call query")?;
+    let callee_idx = call_q.capture_index_for_name("callee").context("query lacks @callee")?;
+    let recv_idx = call_q.capture_index_for_name("recv").context("query lacks @recv")?;
     let mut calls = Vec::new();
     let mut cursor = QueryCursor::new();
     let mut it = cursor.matches(&call_q, root, src.as_bytes());
     while let Some(m) = it.next() {
-        for c in m.captures {
-            let at = c.node.start_byte();
-            // Innermost enclosing definition: the narrowest span containing the
-            // call. Without "narrowest", a method's calls would be credited to the
-            // class that encloses it.
-            let owner = spans
+        // Per match, not per capture: a member call matches @recv and @callee
+        // together, and iterating captures would record the call twice.
+        let Some(callee_node) = m.captures.iter().find(|c| c.index == callee_idx).map(|c| c.node)
+        else {
+            continue;
+        };
+        let Some(from) = owner_at(callee_node.start_byte()) else {
+            continue; // top-level call: no caller to attribute it to
+        };
+        calls.push(CallIntent {
+            from,
+            callee: src[callee_node.byte_range()].to_string(),
+            receiver: m
+                .captures
                 .iter()
-                .enumerate()
-                .filter(|(_, (s, e))| *s <= at && at < *e)
-                .min_by_key(|(_, (s, e))| e - s)
-                .map(|(i, _)| i);
-            let Some(from) = owner else { continue }; // top-level call: no caller
-            calls.push(CallIntent {
-                from,
-                callee: src[c.node.byte_range()].to_string(),
+                .find(|c| c.index == recv_idx)
+                .map(|c| src[c.node.byte_range()].to_string()),
+        });
+    }
+
+    let bind_q = Query::new(&ts_lang, TS_BINDINGS).context("compile binding query")?;
+    let b_name = bind_q.capture_index_for_name("name");
+    let b_field = bind_q.capture_index_for_name("field");
+    let b_ty = bind_q.capture_index_for_name("ty").context("query lacks @ty")?;
+    let mut bindings = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut it = cursor.matches(&bind_q, root, src.as_bytes());
+    while let Some(m) = it.next() {
+        let Some(ty_node) = m.captures.iter().find(|c| c.index == b_ty).map(|c| c.node) else {
+            continue;
+        };
+        let ty = src[ty_node.byte_range()].to_string();
+
+        // A class field binds `this.<field>` and is scoped to the class, so a
+        // method body's `this.repo.scan()` finds it. A plain variable or parameter
+        // binds its own name in whatever definition encloses it.
+        if let Some(f) = b_field.and_then(|i| m.captures.iter().find(|c| c.index == i)) {
+            let at = f.node.start_byte();
+            bindings.push(Binding {
+                owner: class_at(at),
+                name: format!("this.{}", &src[f.node.byte_range()]),
+                ty,
+            });
+        } else if let Some(n) = b_name.and_then(|i| m.captures.iter().find(|c| c.index == i)) {
+            let at = n.node.start_byte();
+            bindings.push(Binding {
+                owner: owner_at(at),
+                name: src[n.node.byte_range()].to_string(),
+                ty,
             });
         }
     }
 
-    Ok(Extracted { symbols, calls })
+    Ok(Extracted { symbols, calls, bindings, containers })
 }
 
 /// Resolve bare callee names against the whole-repo symbol index.
