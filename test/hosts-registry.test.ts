@@ -15,7 +15,7 @@ function probeFor(home: string, repo: string): DetectProbe {
 function fresh(): string { return mkdtempSync(join(tmpdir(), 'graft-registry-')); }
 
 test('registry exposes the known hosts', () => {
-  assert.deepEqual(hostIds().sort(), ['adal', 'agents', 'copilot', 'cursor', 'gemini', 'kiro', 'windsurf']);
+  assert.deepEqual(hostIds().sort(), ['adal', 'agents', 'antigravity', 'copilot', 'cursor', 'gemini', 'kiro', 'windsurf']);
   for (const h of HOSTS) {
     assert.ok(h.relPath.length > 0);
     assert.ok(h.content().length > 0);
@@ -33,6 +33,13 @@ test('home config dirs light up their hosts', () => {
   mkdirSync(join(home, '.codex'));
   const ids = detectHosts(probeFor(home, repo)).map((h) => h.id).sort();
   assert.deepEqual(ids, ['agents', 'cursor', 'gemini']);
+});
+
+test('antigravity-cli dir lights up antigravity host', () => {
+  const home = fresh(); const repo = fresh();
+  mkdirSync(join(home, '.gemini', 'antigravity-cli'), { recursive: true });
+  const ids = detectHosts(probeFor(home, repo)).map((h) => h.id).sort();
+  assert.deepEqual(ids, ['antigravity', 'gemini']);
 });
 
 test('repo-local markers also light up hosts', () => {

@@ -61,14 +61,10 @@ export interface ExtractCache {
 /**
  * Where this graft's memo lives: `<outDir>/.cache/extract.<stamp>.json`.
  *
- * The stamp is in the *filename*, not just inside the file, so two grafts working
- * on one repo keep separate memos instead of evicting each other. That is the
- * default install, not an exotic case: `graft init` wires the MCP server as
- * `npx -y @nanonets/graft` (which resolves the latest published version) while the
- * Claude Code hooks run the locally installed one. The moment those two versions
- * differ, a single shared file means the prompt hook and every MCP retrieval take
- * turns rejecting each other's entries and cold-re-parsing the whole repo — the memo
- * would never help anyone.
+ * The stamp is in the *filename*, not just inside the file, so two installed graft
+ * versions working on one repo keep separate memos instead of evicting each other.
+ * If an older agent config and a newer hook briefly coexist, a single shared file
+ * would make them reject each other's entries and cold-reparse the whole repo.
  *
  * Null stamp → null path → no memo at all. See {@link extractorStamp}.
  */

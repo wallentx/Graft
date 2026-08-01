@@ -8,7 +8,7 @@ import {
   formatUpgradeReport,
   resolvePackageJsonPath,
   readCurrentVersion,
-  isRunningViaNpx,
+  isTermuxEnvironment,
 } from '../src/cli-meta.js';
 
 // --- formatVersionReport: pure formatting, injected npm-view results (no network) ---
@@ -30,10 +30,9 @@ test('formatVersionReport: offline / unreachable', () => {
 
 // --- formatUpgradeReport: pure formatting, injected upgrade results (no network, no spawn) ---
 
-test('formatUpgradeReport: npx no-op suggests a permanent install', () => {
+test('formatUpgradeReport: reports a skipped upgrade', () => {
   const out = formatUpgradeReport({ ran: false, ok: true, oldVersion: '0.4.4' });
-  assert.match(out, /npx/);
-  assert.match(out, /npm install -g @nanonets\/graft/);
+  assert.equal(out, 'upgrade not run');
 });
 
 test('formatUpgradeReport: successful upgrade shows old -> new', () => {
@@ -45,6 +44,18 @@ test('formatUpgradeReport: failed install surfaces the error', () => {
   const out = formatUpgradeReport({ ran: true, ok: false, oldVersion: '0.4.4', errorMessage: 'ENOENT' });
   assert.match(out, /failed/);
   assert.match(out, /ENOENT/);
+});
+
+test('formatUpgradeReport: blocked upgrade surfaces the safety reason', () => {
+  const out = formatUpgradeReport({ ran: false, ok: false, errorMessage: 'registry self-upgrade disabled' });
+  assert.equal(out, '✗ registry self-upgrade disabled');
+});
+
+test('isTermuxEnvironment detects Android and Termux prefixes', () => {
+  assert.equal(isTermuxEnvironment('android', {}), true);
+  assert.equal(isTermuxEnvironment('linux', { PREFIX: '/data/data/com.termux/files/usr' }), true);
+  assert.equal(isTermuxEnvironment('linux', { TERMUX_VERSION: '0.119' }), true);
+  assert.equal(isTermuxEnvironment('linux', { PREFIX: '/usr/local' }), false);
 });
 
 // --- resolvePackageJsonPath / readCurrentVersion: real filesystem, no network ---
@@ -65,16 +76,4 @@ test('readCurrentVersion reads the real package.json version', () => {
   const pkg = JSON.parse(readFileSync(resolve(process.cwd(), 'package.json'), 'utf8'));
   const v = readCurrentVersion(pathToFileURL(resolve(process.cwd(), 'src/cli.ts')).href);
   assert.equal(v, pkg.version);
-});
-
-// --- isRunningViaNpx: pure path heuristic ---
-
-test('isRunningViaNpx detects an npx cache path', () => {
-  const npxPath = pathToFileURL('/Users/x/.npm/_npx/abc123/node_modules/@nanonets/graft/dist/cli.js').href;
-  assert.equal(isRunningViaNpx(npxPath), true);
-});
-
-test('isRunningViaNpx is false for a regular global install', () => {
-  const globalPath = pathToFileURL('/usr/local/lib/node_modules/@nanonets/graft/dist/cli.js').href;
-  assert.equal(isRunningViaNpx(globalPath), false);
 });

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mergeGraftSettings } from '../src/claude/settings-merge.js';
 
 const SL = 'node "${CLAUDE_PROJECT_DIR:-.}/.claude/helpers/graft-statusline.cjs"';
+const RETIRED = 'Bash(npx graft:*)';
 
 test('empty settings gets the full Graft blocks', () => {
   const { merged, warnings } = mergeGraftSettings({});
@@ -50,41 +51,41 @@ test('re-running is idempotent (no duplicate Graft entries or footer)', () => {
 test('foreign top-level keys survive', () => {
   const { merged } = mergeGraftSettings({ model: 'claude-sonnet-5', permissions: { allow: ['Bash(ls)'] } });
   assert.equal(merged.model, 'claude-sonnet-5');
-  assert.deepEqual(merged.permissions.allow, ['Bash(ls)', 'Bash(graft:*)', 'Bash(npx graft:*)', 'Bash(graft-dev:*)', 'Bash(node dist/cli.js:*)']);
+  assert.deepEqual(merged.permissions.allow, ['Bash(ls)', 'Bash(graft:*)', 'Bash(graft-dev:*)', 'Bash(node dist/cli.js:*)']);
 });
 
 test('fresh init adds the graft CLI allowlist', () => {
   const { merged } = mergeGraftSettings({});
-  assert.deepEqual(merged.permissions.allow, ['Bash(graft:*)', 'Bash(npx graft:*)', 'Bash(graft-dev:*)', 'Bash(node dist/cli.js:*)']);
+  assert.deepEqual(merged.permissions.allow, ['Bash(graft:*)', 'Bash(graft-dev:*)', 'Bash(node dist/cli.js:*)']);
 });
 
 test('re-init does not duplicate allowlist entries', () => {
   const once = mergeGraftSettings({}).merged;
   const twice = mergeGraftSettings(once).merged;
-  assert.deepEqual(twice.permissions.allow, ['Bash(graft:*)', 'Bash(npx graft:*)', 'Bash(graft-dev:*)', 'Bash(node dist/cli.js:*)']);
+  assert.deepEqual(twice.permissions.allow, ['Bash(graft:*)', 'Bash(graft-dev:*)', 'Bash(node dist/cli.js:*)']);
 });
 
 test('pre-existing unrelated allow entries are preserved and ours appended', () => {
   const existing = { permissions: { allow: ['Bash(ls)', 'Bash(git:*)'] } };
   const { merged } = mergeGraftSettings(existing);
-  assert.deepEqual(merged.permissions.allow, ['Bash(ls)', 'Bash(git:*)', 'Bash(graft:*)', 'Bash(npx graft:*)', 'Bash(graft-dev:*)', 'Bash(node dist/cli.js:*)']);
+  assert.deepEqual(merged.permissions.allow, ['Bash(ls)', 'Bash(git:*)', 'Bash(graft:*)', 'Bash(graft-dev:*)', 'Bash(node dist/cli.js:*)']);
 });
 
 test('a partially-present allowlist gains only what it lacks, in order', () => {
   const existing = { permissions: { allow: ['Bash(graft:*)'] } };
   const { merged } = mergeGraftSettings(existing);
-  assert.deepEqual(merged.permissions.allow, ['Bash(graft:*)', 'Bash(npx graft:*)', 'Bash(graft-dev:*)', 'Bash(node dist/cli.js:*)']);
+  assert.deepEqual(merged.permissions.allow, ['Bash(graft:*)', 'Bash(graft-dev:*)', 'Bash(node dist/cli.js:*)']);
 });
 
-test('pre-existing allow entries are kept and only the missing ones appended', () => {
-  const existing = { permissions: { allow: ['Bash(graft:*)', 'Bash(npx graft:*)'] } };
+test('pre-existing retired package-manager permission is removed', () => {
+  const existing = { permissions: { allow: ['Bash(graft:*)', RETIRED] } };
   const { merged } = mergeGraftSettings(existing);
-  assert.deepEqual(merged.permissions.allow, ['Bash(graft:*)', 'Bash(npx graft:*)', 'Bash(graft-dev:*)', 'Bash(node dist/cli.js:*)']);
+  assert.deepEqual(merged.permissions.allow, ['Bash(graft:*)', 'Bash(graft-dev:*)', 'Bash(node dist/cli.js:*)']);
 });
 
 test('permissions object with no allow key gets one added; other keys preserved', () => {
   const existing = { permissions: { deny: ['Bash(rm:*)'] } };
   const { merged } = mergeGraftSettings(existing);
   assert.deepEqual(merged.permissions.deny, ['Bash(rm:*)']);
-  assert.deepEqual(merged.permissions.allow, ['Bash(graft:*)', 'Bash(npx graft:*)', 'Bash(graft-dev:*)', 'Bash(node dist/cli.js:*)']);
+  assert.deepEqual(merged.permissions.allow, ['Bash(graft:*)', 'Bash(graft-dev:*)', 'Bash(node dist/cli.js:*)']);
 });

@@ -17,7 +17,7 @@
  * CLI print/exit wrappers and the per-child build orchestration live in
  * `workspace-cli.ts`; `mcp/tools.ts` calls the federate* functions directly.
  */
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { contextDirFor } from "../context/node-file.js";
 import { checkGraph } from "./check.js";
@@ -90,6 +90,7 @@ export function isWorkspaceBuildRoot(root: string, override?: string): boolean {
 /** True when the parent has a mega-graph from an older single-graph build
  * (`graft/.graph/wiring.json`) — the thing a workspace build migrates away. */
 export function hasMegaGraph(root: string, override?: string): boolean {
+  if (readWorkspace(root, override)) return false;
   return existsSync(wiringPath(contextDirFor(root, override)));
 }
 
@@ -102,14 +103,6 @@ export function migrationNote(children: string[]): string {
     `each repo now gets its own committable graft/ (${dirs}); the combined graph ` +
     `here is replaced by a workspace index. Queries from here now search all repos, fairly.`
   );
-}
-
-/** Remove the parent's entire `graft/` tree — the mega-graph, its `.cache`, and
- * any stale cards — so after `writeWorkspace` the parent holds ONLY
- * workspace.json. Child graphs live in sibling `<child>/graft/`, never under
- * this dir, so they are untouched. */
-export function clearParentGraft(root: string, override?: string): void {
-  rmSync(contextDirFor(root, override), { recursive: true, force: true });
 }
 
 export interface LoadedChild {
@@ -445,7 +438,9 @@ export function federateCallers(
 /**
  * Split a parent into a workspace: build each git child (via the supplied
  * `buildChild` callback, so this stays free of any engine/LLM dependency),
- * then REPLACE the parent's `graft/` with just `workspace.json`. `onStart`
+ * then make `workspace.json` authoritative. Existing parent graph artifacts are
+ * preserved as inert, regenerable cache: workspace conversion never deletes a
+ * user-selected `--dir`. `onStart`
  * fires once — before any child is built — carrying whether this build is a
  * mega-graph migration, so the caller can print the one-time split warning
  * first, exactly as the spec requires.
@@ -464,8 +459,7 @@ export async function splitWorkspace(
   const migrated = hasMegaGraph(root, override);
   onStart?.({ children, migrated });
   for (const child of children) await buildChild(join(root, child), child);
-  clearParentGraft(root, override); // drop the mega-graph/.cache/cards…
-  writeWorkspace(root, { version: 1, children }, override); // …leaving ONLY workspace.json
+  writeWorkspace(root, { version: 1, children }, override);
   return { children, migrated };
 }
 
