@@ -57,19 +57,22 @@
 ## Quick start
 
 ```bash
-npm install -g @nanonets/graft   # install the CLI, once
+npm install -g 'git+https://github.com/wallentx/Graft.git#dev'
 graft init                       # build the graph + wire it into Claude Code
 ```
 
 On Termux, install the native build toolchain first. Graft's Tree-sitter parsers
-compile from source on Android, so the first install can take a few minutes. Run
-the install from this Termux-compatible checkout; do not replace it with the
+compile from source on Android, so the first install can take a few minutes. Install
+the `dev` branch from this Termux-compatible fork; do not replace it with the
 upstream registry build:
 
 ```bash
-pkg install nodejs python make clang
-npm install -g .
+pkg install git nodejs python make clang
+npm install -g 'git+https://github.com/wallentx/Graft.git#dev'
 ```
+
+The `dev` branch is intentionally mutable. For a reproducible install, replace
+`dev` with a reviewed full commit SHA.
 
 That is the whole setup. `graft init` asks which of your coding agents to wire up, builds `graft/` from your code, and drops a statusline and hooks into `.claude/`, so from the next session on Graft rides along in Claude Code: it pulls the matching nodes into each prompt and rebuilds the graph in the background after every turn. No daemon, no re-indexing to remember, nothing to run or maintain by default — the graph is just files.
 
