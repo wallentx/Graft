@@ -12,6 +12,12 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # package.json declares engines.node >=20; test the range we claim,
+        # not just its floor.
+        node-version: ['20', '22', '24']
     steps:
       - name: Checkout code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -21,7 +27,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '20'
+          node-version: ${{ matrix.node-version }}
           cache: npm
 
       - name: Install dependencies
@@ -29,3 +35,60 @@ jobs:
 
       - name: Test
         run: npm test
+
+  # The README tells people to install this fork with
+  #   npm install -g 'git+https://github.com/wallentx/Graft.git#dev'
+  # which is a different code path from `npm ci`: it runs `prepare` (a full
+  # tsc + viewer build) inside npm's git clone, compiles the tree-sitter native
+  # addons, and wires the `graft` bin's shebang. `npm test` exercises none of
+  # that. Installing from the local .git reproduces it without the network.
+  install-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # npm must be able to resolve the committish below
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+
+      - name: Install globally from git, exactly as the README prescribes
+        run: npm install -g "git+file://${GITHUB_WORKSPACE}/.git#${GITHUB_SHA}"
+
+      - name: The installed bin runs (catches a broken shebang or bin mapping)
+        run: |
+          set -euxo pipefail
+          command -v graft
+          graft --version
+
+      - name: Build a graph end to end (exercises the native tree-sitter addons)
+        run: |
+          set -euxo pipefail
+          smoke="$(mktemp -d)"
+          mkdir -p "$smoke/src"
+          cat > "$smoke/src/a.ts" <<'TS'
+          export function greet(name: string): string {
+            return `hello ${name}`;
+          }
+          export function main(): string {
+            return greet('world');
+          }
+          TS
+          git -C "$smoke" init -q
+          git -C "$smoke" add -A
+          git -C "$smoke" -c user.email=ci@example.com -c user.name=CI commit -qm init
+          graft build "$smoke"
+          graft ask 'greet' --in "$smoke" || graft ask 'greet'
+          graft callers greet
+        working-directory: ${{ runner.temp }}
+
+      - name: init --dry-run writes nothing
+        run: |
+          set -euxo pipefail
+          dry="$(mktemp -d)"
+          graft init "$dry" --dry-run --agents claude
+          test -z "$(ls -A "$dry")" || { echo "--dry-run wrote files:"; ls -Ra "$dry"; exit 1; }
