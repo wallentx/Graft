@@ -9,6 +9,10 @@ import {
   resolvePackageJsonPath,
   readCurrentVersion,
   isTermuxEnvironment,
+  classifyInstall,
+  detectInstallSource,
+  upgradeBlockReason,
+  runUpgrade,
 } from '../src/cli-meta.js';
 
 // --- formatVersionReport: pure formatting, injected npm-view results (no network) ---
@@ -76,4 +80,81 @@ test('readCurrentVersion reads the real package.json version', () => {
   const pkg = JSON.parse(readFileSync(resolve(process.cwd(), 'package.json'), 'utf8'));
   const v = readCurrentVersion(pathToFileURL(resolve(process.cwd(), 'src/cli.ts')).href);
   assert.equal(v, pkg.version);
+});
+
+// --- install provenance: what gates `graft upgrade`, replacing the old platform check ---
+
+test('classifyInstall: global entry resolving to this package root is a registry install', () => {
+  assert.equal(classifyInstall({
+    pkgRoot: '/usr/lib/node_modules/@nanonets/graft',
+    globalRealPath: '/usr/lib/node_modules/@nanonets/graft',
+    globalIsSymlink: false,
+    hasGitDir: false,
+  }), 'registry');
+});
+
+test('classifyInstall: a .git dir means a working tree, never a packed install', () => {
+  // npm strips .git when it packs, including for git+https:// installs — so its
+  // presence is decisive regardless of what the global entry looks like.
+  assert.equal(classifyInstall({
+    pkgRoot: '/home/me/src/Graft',
+    globalRealPath: '/home/me/src/Graft',
+    globalIsSymlink: false,
+    hasGitDir: true,
+  }), 'checkout');
+});
+
+test('classifyInstall: a symlinked global entry is an npm link', () => {
+  assert.equal(classifyInstall({
+    pkgRoot: '/home/me/src/Graft',
+    globalRealPath: '/home/me/src/Graft',
+    globalIsSymlink: true,
+    hasGitDir: false,
+  }), 'linked');
+});
+
+test('classifyInstall: unresolvable or mismatched global entry is unknown, not registry', () => {
+  assert.equal(classifyInstall({
+    pkgRoot: '/opt/graft', globalRealPath: null, globalIsSymlink: false, hasGitDir: false,
+  }), 'unknown', 'no npm root -g → cannot claim registry');
+  assert.equal(classifyInstall({
+    pkgRoot: '/opt/graft', globalRealPath: '/usr/lib/node_modules/@nanonets/graft',
+    globalIsSymlink: false, hasGitDir: false,
+  }), 'unknown', 'running a copy that is not the global install');
+});
+
+test('upgradeBlockReason: only a registry install may self-upgrade', () => {
+  assert.equal(upgradeBlockReason('registry', false), null);
+  for (const src of ['checkout', 'linked', 'unknown'] as const) {
+    assert.match(upgradeBlockReason(src, false) ?? '', /\S/, `${src} must be blocked`);
+  }
+});
+
+test('upgradeBlockReason: names the specific hazard, not just the platform', () => {
+  assert.match(upgradeBlockReason('linked', false) ?? '', /symlink/);
+  assert.match(upgradeBlockReason('checkout', false) ?? '', /discard local commits/);
+  // Termux is an addendum to the reason now, not the reason itself.
+  assert.doesNotMatch(upgradeBlockReason('linked', false) ?? '', /Termux/);
+  assert.match(upgradeBlockReason('linked', true) ?? '', /Termux/);
+});
+
+test('runUpgrade refuses without spawning npm when provenance is unsafe', () => {
+  const url = pathToFileURL(resolve(process.cwd(), 'src/cli.ts')).href;
+  const r = runUpgrade(url, 'linked');
+  assert.equal(r.ran, false, 'npm install -g must not have been spawned');
+  assert.equal(r.ok, false);
+  assert.match(r.errorMessage ?? '', /symlink/);
+});
+
+test('detectInstallSource never throws and returns a known variant', () => {
+  const src = detectInstallSource(pathToFileURL(resolve(process.cwd(), 'src/cli.ts')).href);
+  assert.ok(['registry', 'checkout', 'linked', 'unknown'].includes(src), `got ${src}`);
+  // This repo is a git working tree, so running from it must classify as such.
+  assert.equal(src, 'checkout');
+});
+
+test('formatVersionReport: a non-registry install is not told to run graft upgrade', () => {
+  const out = formatVersionReport('0.4.4', { ok: true, version: '0.4.5' }, 'checkout');
+  assert.doesNotMatch(out, /run graft upgrade/);
+  assert.match(out, /checkout install/);
 });

@@ -31,7 +31,7 @@ import { formatInitEpilogue } from "./cli-epilogue.js";
 import { planInit, selectedWrites } from "./hosts/plan.js";
 import { formatNonInteractiveHelp, formatPlan, runPicker } from "./cli-picker.js";
 import { homedir } from "node:os";
-import { formatUpgradeReport, formatVersionReport, getNpmViewVersion, isTermuxEnvironment, readCurrentVersion, runUpgrade } from "./cli-meta.js";
+import { detectInstallSource, formatUpgradeReport, formatVersionReport, getNpmViewVersion, readCurrentVersion, runUpgrade } from "./cli-meta.js";
 
 const program = new Command();
 const currentVersion = readCurrentVersion(import.meta.url);
@@ -92,19 +92,15 @@ const NO_REFRESH_FLAG = ["--no-refresh", "skip the freshness check — answer fr
 
 program
   .command("version")
-  .description("Print the installed version and, outside Termux, the latest published on npm")
+  .description("Print the installed version, how it was installed, and the latest published on npm")
   .action(() => {
-    if (isTermuxEnvironment()) {
-      console.log(`graft ${currentVersion}\nTermux build: registry update checks disabled`);
-      return;
-    }
     const latest = getNpmViewVersion();
-    console.log(formatVersionReport(currentVersion, latest));
+    console.log(formatVersionReport(currentVersion, latest, detectInstallSource(import.meta.url)));
   });
 
 program
   .command("upgrade")
-  .description("Upgrade the global install from npm (disabled on Termux)")
+  .description("Upgrade the global install from npm (refused unless graft came from the registry)")
   .action(() => {
     const result = runUpgrade(import.meta.url);
     console.log(formatUpgradeReport(result));

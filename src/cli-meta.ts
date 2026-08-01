@@ -4,7 +4,7 @@
  * Split out of cli.ts so the formatting helpers can be unit-tested with
  * injected results instead of hitting the network from tests.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,6 +17,74 @@ export function isTermuxEnvironment(
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
   return platform === "android" || Boolean(env.TERMUX_VERSION) || env.PREFIX?.includes("com.termux") === true;
+}
+
+/**
+ * How this graft got onto the machine.
+ *
+ * `registry` — a plain `npm install -g @nanonets/graft`; the only case where
+ *   replacing it with the published `@latest` is a no-op-shaped upgrade.
+ * `checkout`  — running from a git working tree (a `git+https://…` install that
+ *   kept its tree, or a cloned repo). `npm install -g` would discard local commits.
+ * `linked`    — `npm link`; the global entry is a symlink into a working tree.
+ *   `npm install -g` REPLACES that symlink, silently detaching the dev install.
+ * `unknown`   — could not tell; treated as unsafe, because guessing wrong here
+ *   overwrites someone's working tree with an unrelated package.
+ */
+export type InstallSource = "registry" | "checkout" | "linked" | "unknown";
+
+/** Pure classifier — all I/O is done by {@link detectInstallSource} and passed in. */
+export function classifyInstall(input: {
+  /** realpath of the package root this module was loaded from */
+  pkgRoot: string;
+  /** realpath of `<npm root -g>/<pkg>`, or null when npm/the entry is unavailable */
+  globalRealPath: string | null;
+  /** whether `<npm root -g>/<pkg>` is itself a symlink */
+  globalIsSymlink: boolean;
+  /** whether `<pkgRoot>/.git` exists — npm-packed installs never carry one */
+  hasGitDir: boolean;
+}): InstallSource {
+  if (input.hasGitDir) return "checkout";
+  if (input.globalIsSymlink) return "linked";
+  if (input.globalRealPath === null) return "unknown";
+  return input.globalRealPath === input.pkgRoot ? "registry" : "unknown";
+}
+
+function realpathOrNull(p: string): string | null {
+  try { return realpathSync(p); } catch { return null; }
+}
+
+/** Classify the running install. Never throws; any probe failure degrades to `unknown`. */
+export function detectInstallSource(moduleUrl: string, pkgName: string = PKG_NAME): InstallSource {
+  const pkgRoot = realpathOrNull(dirname(resolvePackageJsonPath(moduleUrl)));
+  if (pkgRoot === null) return "unknown";
+  const root = globalRoot();
+  const globalPkgPath = root ? join(root, ...pkgName.split("/")) : null;
+  let globalIsSymlink = false;
+  if (globalPkgPath !== null) {
+    try { globalIsSymlink = lstatSync(globalPkgPath).isSymbolicLink(); } catch { globalIsSymlink = false; }
+  }
+  return classifyInstall({
+    pkgRoot,
+    globalRealPath: globalPkgPath ? realpathOrNull(globalPkgPath) : null,
+    globalIsSymlink,
+    hasGitDir: existsSync(join(pkgRoot, ".git")),
+  });
+}
+
+/** Why a registry self-upgrade is unsafe here, or null when it is safe. */
+export function upgradeBlockReason(source: InstallSource, termux = isTermuxEnvironment()): string | null {
+  const suffix = termux ? " (update from the Termux-compatible checkout instead)" : "";
+  switch (source) {
+    case "registry":
+      return null;
+    case "checkout":
+      return `graft is running from a git checkout, not a registry install — \`npm install -g ${PKG_NAME}@latest\` would replace it and discard local commits${suffix}`;
+    case "linked":
+      return `graft is \`npm link\`ed to a working tree — \`npm install -g ${PKG_NAME}@latest\` would replace that symlink and detach the dev install${suffix}`;
+    default:
+      return `cannot confirm graft was installed from the npm registry; refusing to overwrite it${suffix}`;
+  }
 }
 
 /** Locates package.json relative to a module URL (works for both `dist/cli.js`
@@ -61,15 +129,25 @@ export function getNpmViewVersion(pkgName: string = PKG_NAME, timeoutMs = 2000):
   }
 }
 
-/** Pure formatter for `graft version` — no I/O, easy to unit-test. */
-export function formatVersionReport(current: string, latest: NpmViewResult): string {
+/** Pure formatter for `graft version` — no I/O, easy to unit-test.
+ *
+ * When the install did not come from the registry, a newer published version is
+ * still worth reporting, but "run graft upgrade" is the wrong advice: that command
+ * will refuse. Name the reason instead of dangling a suggestion that cannot work. */
+export function formatVersionReport(
+  current: string,
+  latest: NpmViewResult,
+  source: InstallSource = "registry",
+): string {
   const lines = [`graft ${current}`];
   if (!latest.ok || !latest.version) {
     lines.push("latest: unreachable (offline?)");
   } else if (latest.version === current) {
     lines.push(`latest on npm: ${current} ✓ up to date`);
-  } else {
+  } else if (source === "registry") {
     lines.push(`latest on npm: ${latest.version} — run graft upgrade`);
+  } else {
+    lines.push(`latest on npm: ${latest.version} — this is a ${source} install; update it at its source`);
   }
   return lines.join("\n");
 }
@@ -128,15 +206,11 @@ export function formatUpgradeReport(result: UpgradeResult): string {
 /** Runs `npm install -g @nanonets/graft@latest` (inheriting stdio so the user
  * sees npm's own progress/errors), then re-reads the freshly installed
  * version. */
-export function runUpgrade(moduleUrl: string): UpgradeResult {
+export function runUpgrade(moduleUrl: string, source = detectInstallSource(moduleUrl)): UpgradeResult {
   const oldVersion = readCurrentVersion(moduleUrl);
-  if (isTermuxEnvironment()) {
-    return {
-      ran: false,
-      ok: false,
-      oldVersion,
-      errorMessage: "registry self-upgrade is disabled on Termux; update from the Termux-compatible checkout",
-    };
+  const blocked = upgradeBlockReason(source);
+  if (blocked !== null) {
+    return { ran: false, ok: false, oldVersion, errorMessage: blocked };
   }
   const res = spawnSync("npm", ["install", "-g", `${PKG_NAME}@latest`], { stdio: "inherit" });
   if (res.error || (res.status ?? 1) !== 0) {
