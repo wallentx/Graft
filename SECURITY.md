@@ -3,8 +3,7 @@
 ## Supported Versions
 
 Graft is pre-1.0 and ships from this fork's `dev` branch. Security fixes target
-the current native Rust CLI. The private legacy TypeScript reference is not a
-supported installation or separately patched product.
+the current native Rust CLI.
 
 ## Reporting a Vulnerability
 

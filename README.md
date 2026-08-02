@@ -5,10 +5,6 @@ SQLite store outside the repository, refreshes changed files incrementally, and
 answers structural and ranked retrieval queries without Node, npm, `npx`, a
 daemon, telemetry, or model API calls.
 
-This fork's Rust rewrite is the default CLI. TypeScript under `src/` remains only
-as the legacy public-library implementation and differential behavior reference
-until the final removal audit.
-
 ## Install from `wallentx/Graft`, branch `dev`
 
 Termux:
@@ -122,8 +118,7 @@ source rows because their checked-out contents can differ.
 ## Viewer and exports
 
 `graft viz` now uses a self-contained Rust-rendered page. It binds only to
-loopback unless `--allow-remote` is explicit. The old D3 viewer remains with the
-legacy TypeScript reference and is not part of the native release.
+loopback unless `--allow-remote` is explicit.
 
 `graft export out/` writes deterministic Markdown cards plus `INDEX.md`.
 `graft export graph.json --json` writes one JSON document. Existing destinations
@@ -168,16 +163,6 @@ cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace --release --locked
 ```
-
-Legacy differential reference:
-
-```sh
-npm ci
-npm test
-```
-
-The npm project is private on this branch and has no `graft` bin mapping. It is
-not an install path.
 
 ## Security
 

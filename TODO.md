@@ -41,8 +41,7 @@ Native Rust rewrite status after local cutover work on `wallentx/rust`.
 - [x] Safe source install docs using the explicit
   `https://github.com/wallentx/Graft.git` repository and `dev` branch. No npm or
   `npx` installation path.
-- [x] npm CLI mapping removed; TypeScript package renamed/private and retained
-  only as the public-API/differential reference.
+- [x] npm CLI mapping and the complete legacy TypeScript/npm package removed.
 - [x] Tracked Node-era `.claude` hooks, shims, statusline, skill, and host config
   removed; local host directories ignored.
 - [x] Stripped archive + SHA-256 packaging script and tag/manual release workflow.
@@ -50,18 +49,21 @@ Native Rust rewrite status after local cutover work on `wallentx/rust`.
   indexing/querying/export/viewer/MCP/init dry-run/SIGPIPE.
 - [x] Termux Bionic-container CI plus a manually dispatched real
   Android/AArch64 self-hosted-runner gate.
-- [x] TypeScript-to-Rust semantic differential fixture for ranked retrieval and
-  call traversal.
+- [x] Pre-cutover TypeScript-to-Rust differential validation completed for
+  ranked retrieval and call traversal; the obsolete harness was then removed.
 - [x] Native Termux release built and validated locally: AArch64 Android ELF,
   `/system/bin/linker64`, Android API 24, stripped; archive checksum verified.
 - [x] Native local suite: 48 Rust tests, rustfmt, clippy `-D warnings`, actionlint,
-  shellcheck, release smoke, MCP smoke, and differential smoke.
+  shellcheck, release smoke, and MCP smoke. Pre-cutover differential smoke also
+  passed before removal of the legacy implementation.
+- [x] Removed obsolete TypeScript sources/tests/viewer, npm metadata, Node-only
+  scripts, differential fixtures, unreferenced media, and generated Node/graph/
+  build caches after the native cutover audit.
 
 ## Deliberate scope decisions
 
 - No native `--deep` or model/network enrichment. Native retrieval is local and
-  deterministic; concept-node fusion belongs to the retained TypeScript library,
-  not the installed CLI.
+  deterministic; legacy concept-node fusion was deliberately retired.
 - No extension-selection flag. One repository identity always indexes the full
   supported-language set; gitignore rules are the opt-out mechanism. Declaration
   files are skipped. Generated/vendor files follow ignore rules rather than
@@ -81,8 +83,8 @@ Native Rust rewrite status after local cutover work on `wallentx/rust`.
   fixed Unicode vocabulary and never emits color.
 - Keep `rust/` as the package directory under a root Cargo workspace. Do not move
   the crate sources again for cosmetic layout reasons.
-- Keep the private TypeScript source/tests/viewer temporarily as executable
-  differential and public-JavaScript-API history. They do not install a CLI.
+- Legacy TypeScript implementation remains available through Git history, not
+  the working tree or installed product.
 
 ## Performance backlog
 
@@ -129,6 +131,3 @@ from the optional local performance backlog.
   `cargo install --git https://github.com/wallentx/Graft.git --branch dev --locked graft`.
 - [ ] Tag the first native release, verify uploaded archive/checksum artifacts,
   and publish an Android/AArch64 artifact produced by the native Termux runner.
-- [ ] After one native release cycle, decide whether any consumer still needs the
-  private TypeScript API. If not, delete `src/`, `test/`, `viewer/`, npm metadata,
-  `.env.example`, `.ignore`, and Node-only scripts in one dedicated cleanup.

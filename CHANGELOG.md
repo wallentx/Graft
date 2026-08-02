@@ -9,8 +9,11 @@
   `mcp`, `init`, `viz`, `export`, `version`, `upgrade`, `completions`, and `cache`.
 - User-level MCP registration only; repository-local Node hooks and tracked
   `.claude` wiring removed.
-- Rust source installation from `wallentx/Graft` branch `dev`; npm CLI mapping
-  removed and the TypeScript package made a private differential reference.
+- Rust source installation from `wallentx/Graft` branch `dev`; completed the
+  native-only cutover by removing the npm CLI mapping, legacy TypeScript package,
+  tests, D3 viewer, Node scripts, differential harness, and unreferenced media.
+- Switched dependency updates and CodeQL analysis from npm/TypeScript to
+  Cargo/Rust.
 - Stripped release archives with SHA-256 sidecars, isolated install smoke,
   Termux Bionic-container CI, and an optional real Android/AArch64 runner gate.
 
