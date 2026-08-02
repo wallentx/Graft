@@ -1,0 +1,32 @@
+name: Release archives
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Package stripped archive and checksum
+        run: sh scripts/package-release.sh release
+
+      - name: Verify checksum
+        run: sha256sum -c release/*.sha256
+
+      - name: Upload archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: graft-linux-x86_64
+          path: release/*
+          if-no-files-found: error

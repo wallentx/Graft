@@ -2,17 +2,16 @@
 
 ## Supported Versions
 
-Graft is pre-1.0 and ships continuously from `main`. Security fixes are made against
-the latest published npm release (`@nanonets/graft`); older versions are not
-separately patched.
+Graft is pre-1.0 and ships from this fork's `dev` branch. Security fixes target
+the current native Rust CLI. The private legacy TypeScript reference is not a
+supported installation or separately patched product.
 
 ## Reporting a Vulnerability
 
 Please do not open a public GitHub issue for security vulnerabilities.
 
 Report vulnerabilities privately via
-[GitHub Security Advisories](https://github.com/NanoNets/Graft/security/advisories/new),
-or email shrish@nanonets.com.
+[GitHub Security Advisories](https://github.com/wallentx/Graft/security/advisories/new).
 
-We'll acknowledge your report within 3 business days and aim to ship a fix or
-mitigation within 30 days, depending on severity.
+Include the Graft version, `graft version` output, platform, and a minimal
+reproduction. Do not include secrets or private source code.

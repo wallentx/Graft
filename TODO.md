@@ -1,132 +1,134 @@
 # TODO
 
-Working notes for the fork. Numbers are measured against this repo unless stated
-otherwise; the TypeScript build is the reference implementation being ported.
+Native Rust rewrite status after local cutover work on `wallentx/rust`.
 
-Status on `wallentx/rust`: 28 tests green, schema v3,
-`build` / `grep` / `callers` / `skeleton` / `map` / `status` implemented for
-TypeScript, Python and Go.
+## Completed locally
 
----
+- [x] Root Cargo workspace with the native crate in `rust/` and one root lockfile.
+- [x] Version aligned at `0.8.2`; release profile uses thin LTO, one codegen unit,
+  and symbol stripping.
+- [x] SQLite schema v4 plus non-destructive v3 -> v4 migration.
+- [x] Incremental per-file extraction cache keyed by content hash and extractor
+  identity; changed/added/deleted files re-resolve repository-wide edges.
+- [x] WAL readers, five-second busy timeout, transaction rollback coverage,
+  integrity check, missing-repository pruning, per-repository reset, and
+  recoverable corrupt-store replacement that preserves the old database.
+- [x] Automatic live-source freshness before read commands, `--no-refresh`,
+  `GRAFT_NO_REFRESH`, and non-mutating CI `check`.
+- [x] TypeScript, TSX, JavaScript/JSX/MJS/CJS, Python, Go, and Rust extraction.
+- [x] Python annotated-parameter -> `self.field` propagation.
+- [x] Go and Rust receiver/module resolution.
+- [x] Bounded symbol and file bodies in ranked retrieval.
+- [x] `build`, ranked/structural `ask`, regex/fixed/case-aware `grep`, qualified
+  `callers`, basename-aware `skeleton`, bounded `map`, `check`, and drift-aware
+  `status`.
+- [x] Stable JSON output for every native read command.
+- [x] Immediate-child multi-repository workspace detection and federation for
+  build/query/check/MCP, with labels and fair interleaving for ranked results.
+- [x] Bounded newline-delimited MCP JSON-RPC with initialize, ping, tool schemas,
+  structured errors, stale/unindexed refusal, and 1 MiB request/response limits.
+- [x] MCP tools for find, grep, callers, skeleton, map, status, and freshness.
+- [x] User-level `init --dry-run` and registration for Claude, Codex, Cursor,
+  Gemini, Antigravity, opencode, and Copilot using the installed binary's
+  absolute path. Existing JSON is merged; invalid JSON is never overwritten;
+  writes are private and atomic.
+- [x] Self-contained loopback-only-by-default Rust HTML viewer and explicit HTML
+  export.
+- [x] Deterministic Markdown-card/`INDEX.md` and JSON exports to explicit paths.
+- [x] Detailed `version`, non-self-modifying `upgrade`, Bash/Zsh/Fish/Elvish/
+  PowerShell completion generation, SIGPIPE handling, and deterministic
+  non-color output.
+- [x] Safe source install docs using the explicit
+  `https://github.com/wallentx/Graft.git` repository and `dev` branch. No npm or
+  `npx` installation path.
+- [x] npm CLI mapping removed; TypeScript package renamed/private and retained
+  only as the public-API/differential reference.
+- [x] Tracked Node-era `.claude` hooks, shims, statusline, skill, and host config
+  removed; local host directories ignored.
+- [x] Stripped archive + SHA-256 packaging script and tag/manual release workflow.
+- [x] Ubuntu isolated-prefix release smoke covering every command help path,
+  indexing/querying/export/viewer/MCP/init dry-run/SIGPIPE.
+- [x] Termux Bionic-container CI plus a manually dispatched real
+  Android/AArch64 self-hosted-runner gate.
+- [x] TypeScript-to-Rust semantic differential fixture for ranked retrieval and
+  call traversal.
+- [x] Native Termux release built and validated locally: AArch64 Android ELF,
+  `/system/bin/linker64`, Android API 24, stripped; archive checksum verified.
+- [x] Native local suite: 48 Rust tests, rustfmt, clippy `-D warnings`, actionlint,
+  shellcheck, release smoke, MCP smoke, and differential smoke.
 
-## Rust port — remaining commands
+## Deliberate scope decisions
 
-### `ask` — the ranked retrieval scorer
-**Not started. The hard one.**
+- No native `--deep` or model/network enrichment. Native retrieval is local and
+  deterministic; concept-node fusion belongs to the retained TypeScript library,
+  not the installed CLI.
+- No extension-selection flag. One repository identity always indexes the full
+  supported-language set; gitignore rules are the opt-out mechanism. Declaration
+  files are skipped. Generated/vendor files follow ignore rules rather than
+  filename guesses.
+- Native dependency traversal uses `calls`, `imports`, and `contains`. Reference,
+  inheritance, and implementation edges are not part of the native `callers`
+  contract. Unknown receiver types remain unresolved instead of creating false
+  same-name hubs.
+- Linked Git worktrees keep separate source rows because their checked-out files
+  can differ. `git_common_dir` is recorded for diagnosis only.
+- No repository-local agent instructions or background edit hooks. Query-time
+  freshness replaces hooks and keeps global instructions silent outside indexed
+  repositories.
+- No self-updater or downloaded installer execution. Updates stay under Cargo,
+  Git, or a release manager.
+- No ASCII-mode flag. JSON contains data-only strings; human output uses a small
+  fixed Unicode vocabulary and never emits color.
+- Keep `rust/` as the package directory under a root Cargo workspace. Do not move
+  the crate sources again for cosmetic layout reasons.
+- Keep the private TypeScript source/tests/viewer temporarily as executable
+  differential and public-JavaScript-API history. They do not install a CLI.
 
-Everything else in the port is mechanical; this is where the reference
-implementation's actual value lives. `src/ask/ask.ts` carries idf weighting, a
-strength gate, pytest `test_*.py` / `conftest.py` de-ranking, and junk-token
-gating that the TypeScript suite pins at both ~30-node and ~200-node scale.
+## Performance backlog
 
-Port it last and validate differentially: compare **ranked ID lists**, not
-scores. Identical ordering on the same query is the bar; identical floats are
-not achievable and not the point.
+Performance was not the primary cutover target. The native implementation
+already avoids several obvious costs: unchanged files reuse cached extraction,
+SQLite uses WAL and FTS, indexed bodies are bounded, and release builds use thin
+LTO with stripped symbols. No benchmark suite exists yet, so do not claim the
+Rust CLI is faster than the TypeScript CLI without measurements.
 
-### MCP server
-**Not started.** The gate is already wired — `not_indexed()` in `rust/src/main.rs`
-is the single message every read path routes through, so the "this directory has
-not been indexed by graft" behaviour just needs a JSON-RPC stdio loop in front of
-it. Tools to expose mirror the CLI: find_code, find_all, trace_calls, file_api,
-repo_map.
+- [ ] Add reproducible benchmarks for cold builds, warm no-change builds,
+  one-file rebuilds, common queries, MCP calls, and large multi-repository
+  workspaces. Record wall time, peak memory, and database size on both Termux and
+  a conventional Linux host.
+- [ ] Profile representative workloads before changing hot paths; retain
+  before/after profiles with benchmark results.
+- [ ] Evaluate bounded parallel file parsing while preserving deterministic
+  database contents, output ordering, and useful behavior on memory-constrained
+  phones.
+- [ ] Replace repository-wide edge re-resolution after a changed file with a
+  proven affected-edge update algorithm.
+- [ ] Benchmark larger SQLite write batches, longer-lived prepared statements,
+  query plans, and additional indexes. Keep transaction rollback and concurrent
+  reader guarantees intact.
+- [ ] Reduce extractor and ranking allocations, string cloning, and repeated
+  tokenization where profiling shows meaningful cost.
+- [ ] Evaluate paginated or chunked handling for large exports and MCP tool
+  results while preserving the 1 MiB JSON-RPC frame limit.
+- [ ] Evaluate a Git-assisted freshness fast path with a content-hash fallback
+  for untracked, ignored, non-Git, and timestamp-ambiguous files.
+- [ ] Publish performance claims only with repeatable benchmark commands,
+  fixture sizes, hardware/runtime details, and measured before/after results.
 
-### `export`
-**Not started.** Requested explicitly: regenerate markdown cards + `INDEX.md`
-from the store, on demand, to a path the caller names. This is what replaces the
-old in-repo `graft/` directory for anyone who wants the graph as readable text.
-`--format md|json`, `--out DIR`.
+## Remaining release operations
 
----
+These require pushed GitHub state or external infrastructure and are separate
+from the optional local performance backlog.
 
-## Rust port — fidelity gaps
-
-### Call edges: 1040 vs TypeScript's 1138
-Member calls now resolve **only** through a bound receiver type; an unknown
-receiver produces no edge. That rule removed ~200 false edges (it was attributing
-every `arr.push(...)` in the repo to a local function named `push`, which made
-`push` the top hub at 82 in-edges) at the cost of some true ones the reference
-implementation's more complete binding pass keeps.
-
-The trade is right — hubs being correct matters more than the count matching —
-but the difference is real and worth revisiting if `callers` ever feels thin.
-
-### Python: field assigned from an annotated parameter
-```python
-def __init__(self, store: Store):
-    self.store = store          # not resolved
-```
-`self.store = Store()` works; the above needs the parameter's type propagated
-into the field binding. See `PY_BINDINGS` in `rust/src/extract.rs`.
-
-### Indexed files: 124 vs 126
-The two `.mjs` files under `scripts/`. Add `js`/`mjs`/`cjs` to `Lang::of_path`
-in `rust/src/repo.rs` — the JavaScript grammar is not currently a dependency, so
-this needs `tree-sitter-javascript` added (or the TypeScript grammar reused,
-which parses plain JS).
-
-### Incremental builds
-`files.hash` is populated (FNV-1a, stable across Rust releases — deliberately not
-`DefaultHasher`) but nothing reads it. Every build replaces the whole repo. Doing
-this properly means only re-parsing changed files and re-resolving edges that
-touched them; a partially-correct incremental build is worse than a slower
-complete one, so it stayed out until the whole-repo path was trusted.
-
-Full build of this repo: ~6s for 124 files.
-
-### Workspace federation
-The TypeScript build federates queries across a parent with ≥2 git children.
-Not ported. In the SQLite model this becomes a query across multiple `repo_id`s
-rather than a walk over child directories — likely simpler than the original.
-
----
-
-## Host configuration
-
-Deciding where the graft MCP server and instruction files get registered is
-**independent of the Rust port** and still open. The port writes nothing into a
-repo by design, so the remaining question is only where user-level registration
-lands.
-
-Verified user-level paths (all confirmed on this machine or in vendor docs):
-
-| host | user-level target |
-|---|---|
-| Claude Code | `~/.claude/` — `CLAUDE.md`, `settings.json`, `skills/` |
-| Codex | `~/.codex/config.toml` *(already global)* |
-| Cursor | `~/.cursor/mcp.json` |
-| Gemini CLI | `~/.gemini/settings.json` |
-| Antigravity | `~/.gemini/config/mcp_config.json` *(fixed on `wallentx/fixes`)* |
-| opencode | `~/.config/opencode/` |
-| Copilot | `~/.copilot/copilot-instructions.md` |
-
-**Open design question:** global instructions must stay quiet in repos with no graph.
-The MCP not-indexed gate largely solves this — the server reports the state, so
-the instruction text can be honest without being conditional.
-
----
-
-## TypeScript implementation / infra
-
-### `npm run build` fails on Termux
-Exit 127: `node_modules/.bin/tsc` starts `#!/usr/bin/env node` and `/usr/bin/env`
-does not exist. This means `npm install -g 'git+https://…#dev'` — the install
-command the README prescribes — runs `prepare` → `npm run build` → fails.
-
-Workaround in use: `node node_modules/typescript/bin/tsc -p tsconfig.json`.
-
-Worth confirming whether an interactive Termux shell has `termux-exec` loaded
-(`echo $LD_PRELOAD`). If it does, this is sandbox-only; if not, the documented
-install path is broken on the platform this fork exists to support. The CI smoke
-job runs on ubuntu and will not catch it either way.
-
-### Flaky perf test
-`test/graphrank.test.ts` — `PageRank: broad seeds on a large mostly-dangling
-graph complete fast` asserts `ms < 3000`. Runs in ~1.9s isolated, ~6.3s under
-full-suite contention on this device. It guards against a regression whose
-failure mode is *minutes*, so the threshold is what is fragile. Either raise it
-substantially or assert on operation count instead of wall clock.
-
-### CI does not cover Termux
-The `install-smoke` job added on `wallentx/fixes` validates the git-install path
-on ubuntu, which is where `/usr/bin/env` exists. It cannot catch the shebang
-class of failure that has bitten this fork three times.
+- [ ] Review the worktree, commit on the existing `wallentx/rust` branch, and push
+  only when explicitly requested.
+- [ ] Run GitHub CI and fix any hosted-runner or `termux/termux-docker` drift.
+- [ ] Register/enable a `[self-hosted, termux, ARM64]` runner and run the real
+  Android workflow at least once.
+- [ ] After pushing the implementation to `dev`, verify the documented command:
+  `cargo install --git https://github.com/wallentx/Graft.git --branch dev --locked graft`.
+- [ ] Tag the first native release, verify uploaded archive/checksum artifacts,
+  and publish an Android/AArch64 artifact produced by the native Termux runner.
+- [ ] After one native release cycle, decide whether any consumer still needs the
+  private TypeScript API. If not, delete `src/`, `test/`, `viewer/`, npm metadata,
+  `.env.example`, `.ignore`, and Node-only scripts in one dedicated cleanup.

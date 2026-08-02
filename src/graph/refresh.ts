@@ -99,10 +99,12 @@ export function releaseOnSignal(cache: string): () => void {
 
 /** Wait out someone else's rebuild, then take the lock. False when we couldn't. */
 async function waitForLock(cache: string): Promise<boolean> {
-  const deadline = Date.now() + LOCK_WAIT_MS;
+  // Wall time can jump on Android when the device clock syncs. Lock budgets are
+  // elapsed durations, so use the monotonic clock.
+  const deadline = performance.now() + LOCK_WAIT_MS;
   for (;;) {
     if (acquireLockIn(cache)) return true;
-    if (Date.now() >= deadline) return false;
+    if (performance.now() >= deadline) return false;
     await sleep(LOCK_POLL_MS);
   }
 }

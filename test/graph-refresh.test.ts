@@ -134,9 +134,9 @@ test("a rebuild already in flight is waited out, then reported — never a hang"
   writeFileSync(join(d, "src", "math.ts"), `${MATH}export const X = 1;\n`);
 
   assert.equal(acquireLock(d), true, "hold the lock the way a background sync would");
-  const started = Date.now();
+  const started = performance.now();
   const r = await ensureFreshGraph(d);
-  const waited = Date.now() - started;
+  const waited = performance.now() - started;
   releaseLock(d);
 
   assert.equal(r.refreshed, false);

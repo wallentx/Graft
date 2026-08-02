@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -11,13 +12,101 @@ use crate::repo::{self, Lang, SourceFile};
 /// Identifies the extractor. Any change to the queries or the stored shape must
 /// bump this, because it is what tells an existing store its rows were produced
 /// by a different extractor and cannot be trusted.
-pub const EXTRACTOR_STAMP: &str = "rs-multilang-2";
+pub const EXTRACTOR_STAMP: &str = "rs-multilang-5";
 
 pub struct BuildStats {
     pub files: usize,
     pub symbols: usize,
     pub edges: usize,
     pub unresolved: usize,
+    pub parsed: usize,
+    pub reused: usize,
+    pub deleted: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Freshness {
+    pub indexed: bool,
+    pub extractor_current: bool,
+    pub added: Vec<String>,
+    pub modified: Vec<String>,
+    pub deleted: Vec<String>,
+}
+
+impl Freshness {
+    pub fn is_clean(&self) -> bool {
+        self.indexed
+            && self.extractor_current
+            && self.added.is_empty()
+            && self.modified.is_empty()
+            && self.deleted.is_empty()
+    }
+
+    pub fn changed_count(&self) -> usize {
+        self.added.len() + self.modified.len() + self.deleted.len()
+    }
+}
+
+/// Compare the live source set with stored hashes without mutating the store.
+pub fn freshness(db: &Connection, root: &Path) -> Result<Freshness> {
+    use rusqlite::OptionalExtension;
+
+    let repo: Option<(i64, String)> = db
+        .query_row(
+            "select id, extractor_stamp from repos where root=?1",
+            [root.to_string_lossy()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((repo_id, stamp)) = repo else {
+        return Ok(Freshness {
+            indexed: false,
+            extractor_current: false,
+            added: Vec::new(),
+            modified: Vec::new(),
+            deleted: Vec::new(),
+        });
+    };
+
+    let files = repo::walk(root).context("walk the work tree for freshness")?;
+    let live: HashMap<&str, &str> = files
+        .iter()
+        .map(|file| (file.rel.as_str(), file.hash.as_str()))
+        .collect();
+    let mut stored = HashMap::new();
+    let mut statement = db.prepare("select path, hash from files where repo_id=?1")?;
+    let rows = statement.query_map([repo_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (path, hash) = row?;
+        stored.insert(path, hash);
+    }
+
+    let mut added = Vec::new();
+    let mut modified = Vec::new();
+    for (path, hash) in &live {
+        match stored.get(*path) {
+            None => added.push((*path).to_string()),
+            Some(old) if old != hash => modified.push((*path).to_string()),
+            Some(_) => {}
+        }
+    }
+    let mut deleted: Vec<String> = stored
+        .keys()
+        .filter(|path| !live.contains_key(path.as_str()))
+        .cloned()
+        .collect();
+    added.sort();
+    modified.sort();
+    deleted.sort();
+    Ok(Freshness {
+        indexed: true,
+        extractor_current: stamp == EXTRACTOR_STAMP,
+        added,
+        modified,
+        deleted,
+    })
 }
 
 /// Index `root` into `db`, replacing whatever was there for that repo.
@@ -26,18 +115,33 @@ pub struct BuildStats {
 /// `files.hash` column is populated so an incremental path can be added without a
 /// schema change, but nothing reads it yet — a partially-correct incremental
 /// build is worse than a slower complete one.
+#[derive(Debug)]
+struct ExistingFile {
+    id: i64,
+    hash: String,
+}
+
+struct Pending {
+    rel: String,
+    lang: Lang,
+    file_id: i64,
+    file_symbol: i64,
+    symbol_ids: Vec<i64>,
+    extracted: extract::Extracted,
+}
+
+/// Incrementally index `root` into `db`.
+///
+/// Unchanged files replay their serialized extraction payload and retain stable
+/// file/symbol row ids. Changed and added files alone are parsed. Edges are then
+/// rebuilt from all cached/current extraction payloads because a definition
+/// change in one file can change resolution for callers in every other file.
 pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
     let files = repo::walk(root).context("walk the work tree")?;
     let common = repo::git_common_dir(root);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let now = unix_now();
 
     let tx = db.transaction().context("begin build transaction")?;
-
-    // ON CONFLICT rather than delete-then-insert: the repo row keeps its id, so a
-    // rebuild does not orphan anything that might later reference it.
     tx.execute(
         "insert into repos(root, git_common_dir, indexed_at, extractor_stamp)
          values (?1, ?2, ?3, ?4)
@@ -53,72 +157,89 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
         |r| r.get(0),
     )?;
 
-    // Cascades through symbols and edges, and the FTS triggers retract with them.
-    tx.execute("delete from files where repo_id=?1", [repo_id])?;
+    let existing = load_existing_files(&tx, repo_id)?;
+    let current_paths: std::collections::HashSet<&str> =
+        files.iter().map(|f| f.rel.as_str()).collect();
+    let deleted = existing
+        .keys()
+        .filter(|path| !current_paths.contains(path.as_str()))
+        .count();
 
-    // Pass 1: symbols. Call targets cannot be resolved until every file's symbols
-    // exist, because a callee is usually defined somewhere else.
-    let mut pending: Vec<(String, Lang, Vec<i64>, extract::Extracted)> = Vec::new();
+    // Every relationship is cheap to reconstruct from extraction payloads and
+    // may depend on a changed definition elsewhere. Module nodes are derived from
+    // unresolved imports and are recreated with those relationships.
+    tx.execute("delete from edges where repo_id=?1", [repo_id])?;
+    tx.execute(
+        "delete from symbols where repo_id=?1 and kind='module'",
+        [repo_id],
+    )?;
+    for (path, old) in &existing {
+        if !current_paths.contains(path.as_str()) {
+            tx.execute("delete from files where id=?1", [old.id])?;
+        }
+    }
+
+    let mut pending = Vec::with_capacity(files.len());
+    let mut parsed = 0usize;
+    let mut reused = 0usize;
+    for file in &files {
+        let cached = existing
+            .get(&file.rel)
+            .filter(|old| old.hash == file.hash)
+            .and_then(|old| load_cached(&tx, file, old.id).transpose())
+            .transpose()?;
+
+        if let Some(cached) = cached {
+            tx.execute(
+                "update files set mtime=?1, size=?2 where id=?3",
+                rusqlite::params![file.mtime, file.size, cached.file_id],
+            )?;
+            pending.push(cached);
+            reused += 1;
+            continue;
+        }
+
+        if let Some(old) = existing.get(&file.rel) {
+            tx.execute("delete from files where id=?1", [old.id])?;
+        }
+        pending.push(index_file(&tx, repo_id, file)?);
+        parsed += 1;
+    }
+
     let mut by_name: HashMap<String, Vec<i64>> = HashMap::new();
-    // (class, method) -> ids. What a receiver-typed call resolves against.
     let mut by_container: HashMap<(String, String), Vec<i64>> = HashMap::new();
-    let mut n_symbols = 0usize;
-
-    // A file is a node, like every other symbol. `contains` hangs off it, `map`
-    // groups by it, and imports connect files to files. Modelling it as a row
-    // rather than a special case keeps every traversal uniform.
     let mut file_symbol: HashMap<String, i64> = HashMap::new();
     let mut file_rows: HashMap<String, i64> = HashMap::new();
-
-    for f in &files {
-        let file_id = insert_file(&tx, repo_id, f)?;
-        file_rows.insert(f.rel.clone(), file_id);
-        // Real extent, so a file node reports the span a reader expects rather
-        // than a degenerate L1-L1.
-        let lines = f.text.lines().count().max(1) as i64;
-        tx.execute(
-            "insert into symbols(repo_id, file_id, name, kind, start_line, end_line, signature)
-             values (?1, ?2, ?3, 'file', 1, ?4, ?3)",
-            rusqlite::params![repo_id, file_id, f.rel, lines],
-        )?;
-        let fsym = tx.last_insert_rowid();
-        file_symbol.insert(f.rel.clone(), fsym);
-        n_symbols += 1;
-        let ex = extract::extract(f.lang, &f.text).with_context(|| format!("extract {}", f.rel))?;
-        let mut ids = Vec::with_capacity(ex.symbols.len());
-        for (i, s) in ex.symbols.iter().enumerate() {
-            let container = ex.containers.get(i).cloned().flatten();
-            tx.execute(
-                "insert into symbols(repo_id, file_id, name, kind, start_line, end_line, signature, container)
-                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                rusqlite::params![repo_id, file_id, s.name, s.kind, s.start_line, s.end_line, s.signature, container],
-            )?;
-            let id = tx.last_insert_rowid();
-            ids.push(id);
-            by_name.entry(s.name.clone()).or_default().push(id);
-            if let Some(c) = container {
+    let mut n_symbols = 0usize;
+    for file in &pending {
+        file_symbol.insert(file.rel.clone(), file.file_symbol);
+        file_rows.insert(file.rel.clone(), file.file_id);
+        n_symbols += 1 + file.symbol_ids.len();
+        for (index, symbol) in file.extracted.symbols.iter().enumerate() {
+            let Some(&id) = file.symbol_ids.get(index) else {
+                continue;
+            };
+            by_name.entry(symbol.name.clone()).or_default().push(id);
+            if let Some(container) = file.extracted.containers.get(index).cloned().flatten() {
                 by_container
-                    .entry((c, s.name.clone()))
+                    .entry((container, symbol.name.clone()))
                     .or_default()
                     .push(id);
             }
-            n_symbols += 1;
         }
-        pending.push((f.rel.clone(), f.lang, ids, ex));
     }
 
-    // Containment: every symbol hangs off its innermost enclosing symbol, or off
-    // its file when it is top level.
     let mut n_edges = 0usize;
-    for (rel, _, ids, ex) in &pending {
-        let Some(&fsym) = file_symbol.get(rel) else {
-            continue;
-        };
-        for (i, &id) in ids.iter().enumerate() {
-            let parent = match ex.parents.get(i).copied().flatten() {
-                Some(p) => ids.get(p).copied().unwrap_or(fsym),
-                None => fsym,
-            };
+    for file in &pending {
+        for (index, &id) in file.symbol_ids.iter().enumerate() {
+            let parent = file
+                .extracted
+                .parents
+                .get(index)
+                .copied()
+                .flatten()
+                .and_then(|parent| file.symbol_ids.get(parent).copied())
+                .unwrap_or(file.file_symbol);
             n_edges += tx.execute(
                 "insert or ignore into edges(repo_id, src_symbol_id, dst_symbol_id, kind)
                  values (?1, ?2, ?3, 'contains')",
@@ -127,109 +248,65 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
         }
     }
 
-    // Imports: file -> file when the specifier resolves inside the repo, else
-    // file -> a module node standing in for the external package.
     let mut external: HashMap<String, i64> = HashMap::new();
     let go_module = go_module_path(root);
-    for (rel, lang, _, ex) in &pending {
-        let Some(&fsym) = file_symbol.get(rel) else {
-            continue;
-        };
-        for spec in &ex.imports {
-            let mut targets = resolve_import(rel, *lang, spec, go_module.as_deref(), &file_symbol);
+    for file in &pending {
+        for spec in &file.extracted.imports {
+            let mut targets = resolve_import(
+                &file.rel,
+                file.lang,
+                spec,
+                go_module.as_deref(),
+                &file_symbol,
+            );
             if targets.is_empty() {
-                targets.push(
-                    // One node per external package, created on first sight.
-                    if let Some(&id) = external.get(spec) {
-                        id
-                    } else {
-                        let anchor = *file_rows.get(rel).unwrap();
-                        tx.execute(
-                            "insert into symbols(repo_id, file_id, name, kind, start_line, end_line, signature)
-                             values (?1, ?2, ?3, 'module', 0, 0, ?3)",
-                            rusqlite::params![repo_id, anchor, spec],
-                        )?;
-                        let id = tx.last_insert_rowid();
-                        external.insert(spec.clone(), id);
-                        n_symbols += 1;
-                        id
-                    },
-                );
+                let target = if let Some(&id) = external.get(spec) {
+                    id
+                } else {
+                    let anchor = *file_rows
+                        .get(&file.rel)
+                        .context("missing file row for external import")?;
+                    tx.execute(
+                        "insert into symbols(repo_id, file_id, name, kind, start_line, end_line, signature)
+                         values (?1, ?2, ?3, 'module', 0, 0, ?3)",
+                        rusqlite::params![repo_id, anchor, spec],
+                    )?;
+                    let id = tx.last_insert_rowid();
+                    external.insert(spec.clone(), id);
+                    n_symbols += 1;
+                    id
+                };
+                targets.push(target);
             }
             for target in targets {
                 n_edges += tx.execute(
                     "insert or ignore into edges(repo_id, src_symbol_id, dst_symbol_id, kind)
                      values (?1, ?2, ?3, 'imports')",
-                    rusqlite::params![repo_id, fsym, target],
+                    rusqlite::params![repo_id, file.file_symbol, target],
                 )?;
             }
         }
     }
 
-    // Pass 2: resolve call intents against the now-complete repo-wide index.
     let mut unresolved = 0usize;
-    for (rel, _, ids, ex) in &pending {
-        // Per-file binding lookup: (scope symbol index or None, variable) -> type.
-        let mut binds: HashMap<(Option<usize>, &str), &str> = HashMap::new();
-        for b in &ex.bindings {
-            binds.insert((b.owner, b.name.as_str()), b.ty.as_str());
+    for file in &pending {
+        let mut bindings: HashMap<(Option<usize>, &str), &str> = HashMap::new();
+        for binding in &file.extracted.bindings {
+            bindings.insert((binding.owner, binding.name.as_str()), binding.ty.as_str());
         }
 
-        for c in &ex.calls {
-            // A top-level call is the file's own dependency.
-            let from_id = match c.from {
-                Some(i) => match ids.get(i) {
-                    Some(&id) => id,
-                    None => continue,
-                },
-                None => match file_symbol.get(rel) {
-                    Some(&id) => id,
-                    None => continue,
-                },
-            };
+        for call in &file.extracted.calls {
+            let from_id = call
+                .from
+                .and_then(|index| file.symbol_ids.get(index).copied())
+                .unwrap_or(file.file_symbol);
 
-            // Receiver-typed resolution first: it names one class's method, where
-            // the bare name would match every same-named method in the repo and be
-            // dropped as ambiguous.
-            if let Some(recv) = &c.receiver {
-                // `self` in Python and Go-style receivers behave exactly as `this`
-                // does in TypeScript: they name the enclosing type.
-                let ty = if recv == "this" || recv == "self" {
-                    c.from.and_then(|i| ex.containers.get(i).cloned().flatten())
-                } else if let Some(field) = recv
-                    .strip_prefix("this.")
-                    .or_else(|| recv.strip_prefix("self."))
-                {
-                    // A field binding is scoped to the class, not the method.
-                    let class = c.from.and_then(|i| ex.containers.get(i).cloned().flatten());
-                    class.and_then(|cls| {
-                        ex.symbols
-                            .iter()
-                            .position(|s| s.name == cls && s.kind == "class")
-                            .and_then(|ci| {
-                                // Stored under the bare field name for Python, and
-                                // under `this.<field>` for TypeScript.
-                                binds
-                                    .get(&(Some(ci), format!("this.{field}").as_str()))
-                                    .or_else(|| binds.get(&(Some(ci), field)))
-                                    .copied()
-                            })
-                            .map(str::to_string)
-                    })
-                } else {
-                    // Innermost first: the enclosing definition, then module scope.
-                    // Deeper lexical nesting is not walked — a rarer shape, and
-                    // guessing past the first miss risks a wrong edge.
-                    binds
-                        .get(&(c.from, recv.as_str()))
-                        .or_else(|| binds.get(&(None, recv.as_str())))
-                        .copied()
-                        .map(str::to_string)
-                };
+            if let Some(receiver) = &call.receiver {
+                let ty = receiver_type(&file.extracted, &bindings, call, receiver);
                 if let Some(ty) = ty
                     && let Some([only]) = by_container
-                        .get(&(ty, c.callee.clone()))
-                        .map(|v| v.as_slice())
+                        .get(&(ty, call.callee.clone()))
+                        .map(Vec::as_slice)
                 {
                     n_edges += tx.execute(
                         "insert or ignore into edges(repo_id, src_symbol_id, dst_symbol_id, kind)
@@ -238,30 +315,18 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
                     )?;
                     continue;
                 }
-            }
-
-            // A member call whose receiver type is unknown resolves to nothing.
-            // Falling through to bare-name matching attributes every `arr.push()`
-            // in the repo to a local function that happens to be named `push` —
-            // which is how `push` came out as the top hub with 82 in-edges.
-            if c.receiver.is_some() {
                 unresolved += 1;
                 continue;
             }
 
-            match extract::resolve(&by_name, from_id, &c.callee) {
-                Some(to_id) => {
-                    // OR IGNORE: repeated calls between the same pair collapse to
-                    // the one edge the unique index permits.
+            match extract::resolve(&by_name, from_id, &call.callee) {
+                Some(target) => {
                     n_edges += tx.execute(
                         "insert or ignore into edges(repo_id, src_symbol_id, dst_symbol_id, kind)
                          values (?1, ?2, ?3, 'calls')",
-                        rusqlite::params![repo_id, from_id, to_id],
+                        rusqlite::params![repo_id, from_id, target],
                     )?;
                 }
-                // Calls into node_modules, globals, and ambiguous names all land
-                // here. Counted rather than dropped silently so the number is
-                // visible if it ever looks wrong.
                 None => unresolved += 1,
             }
         }
@@ -273,7 +338,187 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
         symbols: n_symbols,
         edges: n_edges,
         unresolved,
+        parsed,
+        reused,
+        deleted,
     })
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn load_existing_files(
+    tx: &rusqlite::Transaction<'_>,
+    repo_id: i64,
+) -> Result<HashMap<String, ExistingFile>> {
+    let mut statement = tx.prepare("select id, path, hash from files where repo_id=?1")?;
+    let rows = statement.query_map([repo_id], |row| {
+        Ok((
+            row.get::<_, String>(1)?,
+            ExistingFile {
+                id: row.get(0)?,
+                hash: row.get(2)?,
+            },
+        ))
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+fn load_cached(
+    tx: &rusqlite::Transaction<'_>,
+    source: &SourceFile,
+    file_id: i64,
+) -> Result<Option<Pending>> {
+    use rusqlite::OptionalExtension;
+
+    let payload: Option<String> = tx
+        .query_row(
+            "select payload from file_extracts
+              where file_id=?1 and extractor_stamp=?2",
+            rusqlite::params![file_id, EXTRACTOR_STAMP],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let Ok(extracted) = serde_json::from_str::<extract::Extracted>(&payload) else {
+        return Ok(None);
+    };
+    let file_symbol: Option<i64> = tx
+        .query_row(
+            "select id from symbols where file_id=?1 and kind='file'",
+            [file_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(file_symbol) = file_symbol else {
+        return Ok(None);
+    };
+
+    let mut statement = tx.prepare(
+        "select id from symbols
+          where file_id=?1 and kind not in ('file','module')
+          order by id",
+    )?;
+    let symbol_ids: Vec<i64> = statement
+        .query_map([file_id], |row| row.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    if symbol_ids.len() != extracted.symbols.len() {
+        return Ok(None);
+    }
+
+    Ok(Some(Pending {
+        rel: source.rel.clone(),
+        lang: source.lang,
+        file_id,
+        file_symbol,
+        symbol_ids,
+        extracted,
+    }))
+}
+
+fn index_file(
+    tx: &rusqlite::Transaction<'_>,
+    repo_id: i64,
+    source: &SourceFile,
+) -> Result<Pending> {
+    let file_id = insert_file(tx, repo_id, source)?;
+    let lines = source.text.lines().count().max(1) as i64;
+    tx.execute(
+        "insert into symbols(repo_id, file_id, name, kind, start_line, end_line, signature, summary)
+         values (?1, ?2, ?3, 'file', 1, ?4, ?3, ?5)",
+        rusqlite::params![repo_id, file_id, source.rel, lines, bounded_text(&source.text)],
+    )?;
+    let file_symbol = tx.last_insert_rowid();
+    let extracted = extract::extract(source.lang, &source.text)
+        .with_context(|| format!("extract {}", source.rel))?;
+    let mut symbol_ids = Vec::with_capacity(extracted.symbols.len());
+    for (index, symbol) in extracted.symbols.iter().enumerate() {
+        let container = extracted.containers.get(index).cloned().flatten();
+        tx.execute(
+            "insert into symbols(repo_id, file_id, name, kind, start_line, end_line, signature, container, summary)
+             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                repo_id,
+                file_id,
+                symbol.name,
+                symbol.kind,
+                symbol.start_line,
+                symbol.end_line,
+                symbol.signature,
+                container,
+                symbol.search_text
+            ],
+        )?;
+        symbol_ids.push(tx.last_insert_rowid());
+    }
+    let payload = serde_json::to_string(&extracted).context("serialize extraction cache")?;
+    tx.execute(
+        "insert into file_extracts(file_id, extractor_stamp, payload)
+         values (?1, ?2, ?3)",
+        rusqlite::params![file_id, EXTRACTOR_STAMP, payload],
+    )?;
+
+    Ok(Pending {
+        rel: source.rel.clone(),
+        lang: source.lang,
+        file_id,
+        file_symbol,
+        symbol_ids,
+        extracted,
+    })
+}
+
+fn bounded_text(text: &str) -> &str {
+    const LIMIT: usize = 32 * 1024;
+    if text.len() <= LIMIT {
+        return text;
+    }
+    let mut end = LIMIT;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn receiver_type(
+    extracted: &extract::Extracted,
+    bindings: &HashMap<(Option<usize>, &str), &str>,
+    call: &extract::CallIntent,
+    receiver: &str,
+) -> Option<String> {
+    if receiver == "this" || receiver == "self" {
+        return call
+            .from
+            .and_then(|index| extracted.containers.get(index).cloned().flatten());
+    }
+    if let Some(field) = receiver
+        .strip_prefix("this.")
+        .or_else(|| receiver.strip_prefix("self."))
+    {
+        let class = call
+            .from
+            .and_then(|index| extracted.containers.get(index).cloned().flatten())?;
+        let class_index = extracted
+            .symbols
+            .iter()
+            .position(|symbol| symbol.name == class && symbol.kind == "class")?;
+        return bindings
+            .get(&(Some(class_index), format!("this.{field}").as_str()))
+            .or_else(|| bindings.get(&(Some(class_index), field)))
+            .copied()
+            .map(str::to_string);
+    }
+    bindings
+        .get(&(call.from, receiver))
+        .or_else(|| bindings.get(&(None, receiver)))
+        .copied()
+        .map(str::to_string)
 }
 
 /// Lexically normalize a repo-relative path without consulting the filesystem.
@@ -306,7 +551,7 @@ fn resolve_import(
 ) -> Vec<i64> {
     let from_dir = Path::new(from_rel).parent().unwrap_or(Path::new(""));
     let candidates = match lang {
-        Lang::TypeScript | Lang::Tsx => {
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => {
             if !spec.starts_with('.') {
                 return Vec::new();
             }
@@ -315,9 +560,15 @@ fn resolve_import(
             vec![
                 format!("{base}.ts"),
                 format!("{base}.tsx"),
+                format!("{base}.js"),
+                format!("{base}.mjs"),
+                format!("{base}.cjs"),
                 stem.clone(),
                 format!("{base}/index.ts"),
                 format!("{base}/index.tsx"),
+                format!("{base}/index.js"),
+                format!("{base}/index.mjs"),
+                format!("{base}/index.cjs"),
             ]
         }
         Lang::Python => {
@@ -357,10 +608,64 @@ fn resolve_import(
             ids.sort_unstable();
             return ids;
         }
+        Lang::Rust => return resolve_rust_import(from_rel, spec, files),
     };
     for candidate in candidates {
         if let Some(&id) = files.get(&candidate) {
             return vec![id];
+        }
+    }
+    Vec::new()
+}
+
+fn resolve_rust_import(from_rel: &str, spec: &str, files: &HashMap<String, i64>) -> Vec<i64> {
+    let from_dir = Path::new(from_rel).parent().unwrap_or(Path::new(""));
+    let crate_dir = if let Some(index) = from_rel.rfind("/src/") {
+        Path::new(&from_rel[..index + 4]).to_path_buf()
+    } else if from_rel.starts_with("src/") {
+        Path::new("src").to_path_buf()
+    } else {
+        from_dir.to_path_buf()
+    };
+
+    let mut raw = spec
+        .split(" as ")
+        .next()
+        .unwrap_or(spec)
+        .split('{')
+        .next()
+        .unwrap_or(spec)
+        .trim_end_matches(':')
+        .trim_end_matches("::*")
+        .to_string();
+    let (base, explicitly_local) = if let Some(rest) = raw.strip_prefix("crate::") {
+        raw = rest.to_string();
+        (crate_dir, true)
+    } else if let Some(rest) = raw.strip_prefix("self::") {
+        raw = rest.to_string();
+        (from_dir.to_path_buf(), true)
+    } else if let Some(rest) = raw.strip_prefix("super::") {
+        raw = rest.to_string();
+        let mut base = from_dir.to_path_buf();
+        base.pop();
+        (base, true)
+    } else {
+        (from_dir.to_path_buf(), !raw.contains("::"))
+    };
+    if !explicitly_local || raw.is_empty() {
+        return Vec::new();
+    }
+
+    let segments: Vec<&str> = raw
+        .split("::")
+        .filter(|segment| !segment.is_empty() && *segment != "self")
+        .collect();
+    for length in (1..=segments.len()).rev() {
+        let module = normalize_path(&base.join(segments[..length].join("/")));
+        for candidate in [format!("{module}.rs"), format!("{module}/mod.rs")] {
+            if let Some(&id) = files.get(&candidate) {
+                return vec![id];
+            }
         }
     }
     Vec::new()
@@ -385,13 +690,15 @@ fn insert_file(tx: &rusqlite::Transaction, repo_id: i64, f: &SourceFile) -> Resu
     Ok(tx.last_insert_rowid())
 }
 
-/// One occurrence of the literal, with the line it sits on.
+/// One occurrence of the pattern, with the line it sits on.
+#[derive(Debug, Serialize)]
 pub struct Occurrence {
     pub line: i64,
     pub text: String,
 }
 
 /// Occurrences grouped under the symbol that encloses them.
+#[derive(Debug, Serialize)]
 pub struct Group {
     pub path: String,
     /// None for a match outside any definition — imports, top-level config.
@@ -403,6 +710,7 @@ pub struct Group {
     pub hits: Vec<Occurrence>,
 }
 
+#[derive(Debug, Serialize)]
 pub struct GrepResult {
     pub groups: Vec<Group>,
     pub total_hits: usize,
@@ -431,7 +739,43 @@ struct SpanRow {
 /// Files are re-read from the work tree rather than duplicated into the store.
 /// The store holds structure; the source is already on disk, and copying it would
 /// double the database for data that goes stale the moment anyone edits.
+pub struct GrepOptions<'a> {
+    pub ignore_case: bool,
+    pub fixed: bool,
+    pub scope: Option<&'a str>,
+}
+
+#[cfg(test)]
 pub fn grep(db: &Connection, repo_id: i64, root: &Path, needle: &str) -> Result<GrepResult> {
+    grep_with_options(
+        db,
+        repo_id,
+        root,
+        needle,
+        GrepOptions {
+            ignore_case: false,
+            fixed: true,
+            scope: None,
+        },
+    )
+}
+
+pub fn grep_with_options(
+    db: &Connection,
+    repo_id: i64,
+    root: &Path,
+    pattern: &str,
+    options: GrepOptions<'_>,
+) -> Result<GrepResult> {
+    let expression = if options.fixed {
+        regex::escape(pattern)
+    } else {
+        pattern.to_string()
+    };
+    let matcher = regex::RegexBuilder::new(&expression)
+        .case_insensitive(options.ignore_case)
+        .build()
+        .with_context(|| format!("invalid regex {pattern:?}"))?;
     // Symbol spans per file, so a matching line can be attributed to a definition.
     let mut spans: HashMap<String, Vec<SpanRow>> = HashMap::new();
     let mut stmt = db.prepare(
@@ -455,8 +799,11 @@ pub fn grep(db: &Connection, repo_id: i64, root: &Path, needle: &str) -> Result<
 
     let mut files_stmt = db.prepare("select path from files where repo_id=?1 order by path")?;
     let paths: Vec<String> = files_stmt
-        .query_map([repo_id], |r| r.get(0))?
-        .collect::<Result<_, _>>()?;
+        .query_map([repo_id], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|path| options.scope.is_none_or(|scope| path_in_scope(path, scope)))
+        .collect();
 
     let mut groups: Vec<Group> = Vec::new();
     let mut total_hits = 0usize;
@@ -470,7 +817,7 @@ pub fn grep(db: &Connection, repo_id: i64, root: &Path, needle: &str) -> Result<
         // (symbol key) -> group index, so occurrences accumulate per definition.
         let mut seen: HashMap<Option<i64>, usize> = HashMap::new();
         for (i, line_text) in text.lines().enumerate() {
-            if !line_text.contains(needle) {
+            if !matcher.is_match(line_text) {
                 continue;
             }
             let line = i as i64 + 1;
@@ -524,6 +871,11 @@ pub fn grep(db: &Connection, repo_id: i64, root: &Path, needle: &str) -> Result<
     })
 }
 
+pub fn path_in_scope(path: &str, scope: &str) -> bool {
+    let scope = scope.trim_matches('/');
+    scope.is_empty() || path == scope || path.starts_with(&format!("{scope}/"))
+}
+
 pub fn repo_id_of(db: &Connection, root: &Path) -> Result<Option<i64>> {
     let mut stmt = db.prepare("select id from repos where root=?1 and extractor_stamp=?2")?;
     let mut rows = stmt.query(rusqlite::params![root.to_string_lossy(), EXTRACTOR_STAMP])?;
@@ -533,8 +885,41 @@ pub fn repo_id_of(db: &Connection, root: &Path) -> Result<Option<i64>> {
     })
 }
 
+#[derive(Debug, Serialize)]
+pub struct RepoStatus {
+    pub files: i64,
+    pub symbols: i64,
+    pub edges: i64,
+    pub extractor_stamp: String,
+    pub indexed_at: i64,
+}
+
+pub fn repo_status(db: &Connection, repo_id: i64) -> Result<RepoStatus> {
+    db.query_row(
+        "select
+            (select count(*) from files where repo_id=?1),
+            (select count(*) from symbols where repo_id=?1),
+            (select count(*) from edges where repo_id=?1),
+            extractor_stamp, indexed_at
+           from repos where id=?1",
+        [repo_id],
+        |row| {
+            Ok(RepoStatus {
+                files: row.get(0)?,
+                symbols: row.get(1)?,
+                edges: row.get(2)?,
+                extractor_stamp: row.get(3)?,
+                indexed_at: row.get(4)?,
+            })
+        },
+    )
+    .context("read repository status")
+}
+
 /// One step away from the seed, with the distance that reached it.
+#[derive(Debug, Serialize)]
 pub struct Reached {
+    pub id: i64,
     pub name: String,
     pub kind: String,
     pub path: String,
@@ -542,8 +927,11 @@ pub struct Reached {
     pub end_line: i64,
     pub edge: String,
     pub depth: usize,
+    pub signature: String,
+    pub in_edges: i64,
 }
 
+#[derive(Debug, Serialize)]
 pub struct Seed {
     pub id: i64,
     pub name: String,
@@ -558,6 +946,7 @@ pub struct Seed {
 /// `Out` follows src->dst (what this calls); the default follows dst->src (what
 /// calls this). Breadth-first and visited-guarded, so a cycle terminates and each
 /// symbol is reported at its shortest distance rather than once per path.
+#[cfg(test)]
 pub fn callers(
     db: &Connection,
     repo_id: i64,
@@ -565,23 +954,55 @@ pub fn callers(
     out: bool,
     max_depth: usize,
 ) -> Result<(Vec<Seed>, Vec<Reached>)> {
+    callers_scoped(db, repo_id, name, out, max_depth, None)
+}
+
+pub fn callers_scoped(
+    db: &Connection,
+    repo_id: i64,
+    qualified_name: &str,
+    out: bool,
+    max_depth: usize,
+    scope: Option<&str>,
+) -> Result<(Vec<Seed>, Vec<Reached>)> {
+    let (container, name) = if qualified_name.contains('/') {
+        (None, qualified_name)
+    } else {
+        qualified_name
+            .rsplit_once('.')
+            .map_or((None, qualified_name), |(container, name)| {
+                (Some(container), name)
+            })
+    };
+    let container_tail = container.and_then(|container| container.rsplit('.').next());
     let mut seeds_stmt = db.prepare(
         "select s.id, s.name, s.kind, f.path, s.start_line, s.end_line
            from symbols s join files f on f.id = s.file_id
-          where s.repo_id = ?1 and s.name = ?2
+          where s.repo_id = ?1 and lower(s.name) = lower(?2)
+            and (?3 is null or lower(s.container) in (lower(?3), lower(?4)))
           order by f.path, s.start_line",
     )?;
     let seeds: Vec<Seed> = seeds_stmt
-        .query_map(rusqlite::params![repo_id, name], |r| {
-            Ok(Seed {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                kind: r.get(2)?,
-                path: r.get(3)?,
-                start_line: r.get(4)?,
-                end_line: r.get(5)?,
-            })
-        })?
+        .query_map(
+            rusqlite::params![repo_id, name, container, container_tail],
+            |r| {
+                Ok(Seed {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    kind: r.get(2)?,
+                    path: r.get(3)?,
+                    start_line: r.get(4)?,
+                    end_line: r.get(5)?,
+                })
+            },
+        )?
+        .filter_map(|row| match row {
+            Ok(seed) if scope.is_none_or(|scope| path_in_scope(&seed.path, scope)) => {
+                Some(Ok(seed))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
         .collect::<Result<_, _>>()?;
 
     let (from_col, to_col) = if out {
@@ -590,7 +1011,9 @@ pub fn callers(
         ("dst_symbol_id", "src_symbol_id")
     };
     let sql = format!(
-        "select s.id, s.name, s.kind, f.path, s.start_line, s.end_line, e.kind
+        "select s.id, s.name, s.kind, f.path, s.start_line, s.end_line, e.kind,
+                coalesce(s.signature,''),
+                (select count(*) from edges incoming where incoming.dst_symbol_id=s.id)
            from edges e
            join symbols s on s.id = e.{to_col}
            join files f on f.id = s.file_id
@@ -631,6 +1054,7 @@ pub fn callers(
                 Ok((
                     r.get::<_, i64>(0)?,
                     Reached {
+                        id: r.get(0)?,
                         name: r.get(1)?,
                         kind: r.get(2)?,
                         path: r.get(3)?,
@@ -638,6 +1062,8 @@ pub fn callers(
                         end_line: r.get(5)?,
                         edge: r.get(6)?,
                         depth,
+                        signature: r.get(7)?,
+                        in_edges: r.get(8)?,
                     },
                 ))
             })?;
@@ -646,7 +1072,9 @@ pub fn callers(
                 // First arrival wins: BFS means that is the shortest distance.
                 if seen.insert(id) {
                     next.push(id);
-                    reached.push(hit);
+                    if scope.is_none_or(|scope| path_in_scope(&hit.path, scope)) {
+                        reached.push(hit);
+                    }
                 }
             }
         }
@@ -658,6 +1086,7 @@ pub fn callers(
     Ok((seeds, reached))
 }
 
+#[derive(Debug, Serialize)]
 pub struct SkelRow {
     pub name: String,
     pub kind: String,
@@ -692,6 +1121,38 @@ pub fn skeleton(db: &Connection, repo_id: i64, rel: &str) -> Result<Vec<SkelRow>
         .collect::<Result<Vec<_>, _>>()?)
 }
 
+pub fn skeleton_path(db: &Connection, repo_id: i64, requested: &str) -> Result<Option<String>> {
+    let requested = requested.trim_start_matches("./");
+    let mut exact = db.prepare("select path from files where repo_id=?1 and path=?2")?;
+    if let Some(path) = exact
+        .query_map(rusqlite::params![repo_id, requested], |row| row.get(0))?
+        .next()
+        .transpose()?
+    {
+        return Ok(Some(path));
+    }
+    if requested.contains('/') {
+        return Ok(None);
+    }
+    let mut all = db.prepare("select path from files where repo_id=?1 order by path")?;
+    let matches = all
+        .query_map([repo_id], |row| row.get::<_, String>(0))?
+        .filter_map(|row| match row {
+            Ok(path)
+                if Path::new(&path)
+                    .file_name()
+                    .is_some_and(|name| name == requested) =>
+            {
+                Some(Ok(path))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((matches.len() == 1).then(|| matches[0].clone()))
+}
+
+#[derive(Debug, Serialize)]
 pub struct Hub {
     pub name: String,
     pub kind: String,
@@ -701,6 +1162,7 @@ pub struct Hub {
     pub in_degree: i64,
 }
 
+#[derive(Debug, Serialize)]
 pub struct DirEntry {
     pub dir: String,
     pub files: i64,
@@ -708,11 +1170,13 @@ pub struct DirEntry {
     pub hubs: Vec<Hub>,
 }
 
+#[derive(Debug, Serialize)]
 pub struct RepoMap {
     pub files: i64,
     pub symbols: i64,
     pub edges: i64,
     pub dirs: Vec<DirEntry>,
+    pub dropped_dirs: usize,
     pub hotspots: Vec<Hub>,
 }
 
@@ -798,6 +1262,8 @@ pub fn repo_map(db: &Connection, repo_id: i64, top: usize) -> Result<RepoMap> {
         })
         .collect();
     dirs.sort_by(|a, b| b.symbols.cmp(&a.symbols).then_with(|| a.dir.cmp(&b.dir)));
+    let dropped_dirs = dirs.len().saturating_sub(top);
+    dirs.truncate(top);
 
     let hotspots = all
         .into_iter()
@@ -809,6 +1275,7 @@ pub fn repo_map(db: &Connection, repo_id: i64, top: usize) -> Result<RepoMap> {
         symbols,
         edges,
         dirs,
+        dropped_dirs,
         hotspots,
     })
 }
@@ -910,6 +1377,43 @@ mod tests {
     }
 
     #[test]
+    fn grep_regex_fixed_case_and_scope_options_are_distinct() {
+        let (db, root) = fixture(&[
+            ("src/a.ts", "const a = 'A.B';\nconst b = 'axb';\n"),
+            ("src-extra/a.ts", "const c = 'a.b';\n"),
+        ]);
+        let id = repo_id_of(&db, &root).unwrap().unwrap();
+        let regex = grep_with_options(
+            &db,
+            id,
+            &root,
+            "a.b",
+            GrepOptions {
+                ignore_case: true,
+                fixed: false,
+                scope: Some("src"),
+            },
+        )
+        .unwrap();
+        assert_eq!(regex.total_hits, 2, "regex dot also matches axb");
+        let fixed = grep_with_options(
+            &db,
+            id,
+            &root,
+            "a.b",
+            GrepOptions {
+                ignore_case: true,
+                fixed: true,
+                scope: Some("src"),
+            },
+        )
+        .unwrap();
+        assert_eq!(fixed.total_hits, 1);
+        assert!(fixed.groups.iter().all(|group| group.path == "src/a.ts"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn stale_extractor_rows_force_a_rebuild() {
         let (db, root) = fixture(&[("src/a.ts", "function f() {}\n")]);
         db.execute(
@@ -994,6 +1498,43 @@ mod tests {
     }
 
     #[test]
+    fn rust_module_imports_and_calls_resolve() {
+        let (db, root) = fixture(&[
+            ("rust/src/db.rs", "pub fn helper() {}\n"),
+            (
+                "rust/src/main.rs",
+                "mod db;\nuse crate::db::helper;\nfn main() { helper(); }\n",
+            ),
+        ]);
+        let id = repo_id_of(&db, &root).unwrap().unwrap();
+        let imports: i64 = db
+            .query_row(
+                "select count(*) from edges e
+                   join symbols src on src.id=e.src_symbol_id
+                   join symbols dst on dst.id=e.dst_symbol_id
+                  where e.repo_id=?1 and e.kind='imports'
+                    and src.name='rust/src/main.rs' and dst.name='rust/src/db.rs'",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(imports, 1, "mod/use imports dedupe to one file edge");
+        let calls: i64 = db
+            .query_row(
+                "select count(*) from edges e
+                   join symbols src on src.id=e.src_symbol_id
+                   join symbols dst on dst.id=e.dst_symbol_id
+                  where e.repo_id=?1 and e.kind='calls'
+                    and src.name='main' and dst.name='helper'",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(calls, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn callers_aggregates_symbols_defined_by_a_file_seed() {
         let (db, root) = fixture(&[
             ("src/a.ts", "export function target() {}\n"),
@@ -1026,7 +1567,7 @@ mod tests {
         let before: i64 = db
             .query_row("select count(*) from symbols", [], |r| r.get(0))
             .unwrap();
-        build(&mut db, &root).unwrap();
+        let cached = build(&mut db, &root).unwrap();
         let after: i64 = db
             .query_row("select count(*) from symbols", [], |r| r.get(0))
             .unwrap();
@@ -1034,6 +1575,54 @@ mod tests {
             before, after,
             "a second build must not double the symbol rows"
         );
+        assert_eq!(
+            cached.parsed, 0,
+            "unchanged files must replay extraction cache"
+        );
+        assert_eq!(cached.reused, 1);
+
+        std::fs::write(root.join("src/a.ts"), "export function changed() {}\n").unwrap();
+        let changed = build(&mut db, &root).unwrap();
+        assert_eq!(changed.parsed, 1);
+        assert_eq!(changed.reused, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn incremental_build_reuses_unchanged_files_and_removes_deleted_files() {
+        let (mut db, root) = fixture(&[
+            ("src/a.ts", "export function a() {}\n"),
+            ("src/b.ts", "export function b() {}\n"),
+        ]);
+        std::fs::write(root.join("src/a.ts"), "export function a2() {}\n").unwrap();
+        std::fs::remove_file(root.join("src/b.ts")).unwrap();
+
+        let stats = build(&mut db, &root).unwrap();
+        assert_eq!(stats.parsed, 1);
+        assert_eq!(stats.reused, 0);
+        assert_eq!(stats.deleted, 1);
+        let files: i64 = db
+            .query_row("select count(*) from files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(files, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn freshness_reports_added_modified_and_deleted_paths() {
+        let (db, root) = fixture(&[
+            ("src/a.ts", "export function a() {}\n"),
+            ("src/b.ts", "export function b() {}\n"),
+        ]);
+        assert!(freshness(&db, &root).unwrap().is_clean());
+        std::fs::write(root.join("src/a.ts"), "export function a2() {}\n").unwrap();
+        std::fs::remove_file(root.join("src/b.ts")).unwrap();
+        std::fs::write(root.join("src/c.ts"), "export function c() {}\n").unwrap();
+
+        let state = freshness(&db, &root).unwrap();
+        assert_eq!(state.modified, ["src/a.ts"]);
+        assert_eq!(state.deleted, ["src/b.ts"]);
+        assert_eq!(state.added, ["src/c.ts"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

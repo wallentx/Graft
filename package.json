@@ -1,7 +1,8 @@
 {
-  "name": "@nanonets/graft",
+  "name": "@wallentx/graft-typescript-legacy",
   "version": "0.8.2",
-  "description": "Build a repo's context graph as a folder of linked markdown files that live in the repo and stay in sync with the code through git.",
+  "description": "Legacy TypeScript API and differential reference for the native Graft rewrite.",
+  "private": true,
   "keywords": [
     "ai",
     "agents",
@@ -14,14 +15,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/NanoNets/context-graph-engine.git"
+    "url": "git+https://github.com/wallentx/Graft.git"
   },
-  "homepage": "https://github.com/NanoNets/context-graph-engine#readme",
+  "homepage": "https://github.com/wallentx/Graft#readme",
   "bugs": {
-    "url": "https://github.com/NanoNets/context-graph-engine/issues"
-  },
-  "publishConfig": {
-    "access": "public"
+    "url": "https://github.com/wallentx/Graft/issues"
   },
   "type": "module",
   "main": "./dist/index.js",
@@ -33,9 +31,6 @@
     },
     "./package.json": "./package.json"
   },
-  "bin": {
-    "graft": "dist/cli.js"
-  },
   "files": [
     "dist",
     "scripts",
@@ -46,10 +41,9 @@
     "build": "tsc -p tsconfig.json && tsc -p viewer/tsconfig.json && node scripts/build-viewer.mjs",
     "dev": "tsc -p tsconfig.json --watch",
     "cli": "tsx src/cli.ts",
-    "test": "node --import tsx --test test/*.test.ts",
+    "test": "node --import tsx --test --test-concurrency=1 test/*.test.ts",
     "prepare": "npm run build",
-    "prepublishOnly": "npm run build",
-    "postinstall": "node scripts/postinstall.mjs"
+    "prepublishOnly": "npm run build"
   },
   "engines": {
     "node": ">=20"

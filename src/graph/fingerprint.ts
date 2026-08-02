@@ -83,8 +83,9 @@ export function writeFingerprint(outDir: string, entries: Record<string, Extract
   const files: Record<string, Print> = {};
   for (const [rel, e] of Object.entries(entries)) files[rel] = [e.size, e.mtimeMs, e.hash];
   try {
-    writeJsonAtomic(fingerprintPath(outDir), { version: FINGERPRINT_VERSION, extractor: stamp(), files }, true);
-    pruneSidecars(join(outDir, CACHE_DIR), FINGERPRINT_PREFIX);
+    const path = fingerprintPath(outDir);
+    writeJsonAtomic(path, { version: FINGERPRINT_VERSION, extractor: stamp(), files }, true);
+    pruneSidecars(join(outDir, CACHE_DIR), FINGERPRINT_PREFIX, 2, path);
     return true;
   } catch {
     return false;

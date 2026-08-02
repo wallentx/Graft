@@ -76,7 +76,7 @@ export function extractCachePath(outDir: string): string | null {
 /** Keep `.cache/` from growing a file per version forever: after writing, drop all
  * but the newest `keep` files sharing a prefix. Best-effort and never fatal — this
  * is a cache directory, and a failure here costs disk, not correctness. */
-export function pruneSidecars(cacheDir: string, prefix: string, keep = 2): void {
+export function pruneSidecars(cacheDir: string, prefix: string, keep = 2, protectedPath?: string): void {
   try {
     const mine = readdirSync(cacheDir)
       .filter((f) => f.startsWith(`${prefix}.`) && f.endsWith(".json"))
@@ -84,7 +84,11 @@ export function pruneSidecars(cacheDir: string, prefix: string, keep = 2): void 
         const full = join(cacheDir, f);
         return { full, mtimeMs: statSync(full).mtimeMs };
       })
-      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+      .sort((a, b) =>
+        Number(b.full === protectedPath) - Number(a.full === protectedPath)
+        || b.mtimeMs - a.mtimeMs
+        || a.full.localeCompare(b.full),
+      );
     for (const f of mine.slice(keep)) rmSync(f.full, { force: true });
   } catch {
     /* nothing here is load-bearing */
@@ -211,7 +215,7 @@ export function writeExtractCache(outDir: string, cache: ExtractCache): boolean 
   if (path === null) return false;
   try {
     writeJsonAtomic(path, cache, true);
-    pruneSidecars(join(outDir, CACHE_DIR), EXTRACT_CACHE_PREFIX);
+    pruneSidecars(join(outDir, CACHE_DIR), EXTRACT_CACHE_PREFIX, 2, path);
     return true;
   } catch {
     return false;

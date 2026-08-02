@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased - native Rust cutover
+
+- Native SQLite graph with schema migration, WAL readers, incremental extraction,
+  automatic freshness, repair/prune/reset commands, and recoverable corruption handling.
+- Native TypeScript/TSX/JavaScript, Python, Go, and Rust extraction.
+- Native `build`, `ask`, `grep`, `callers`, `skeleton`, `map`, `check`, `status`,
+  `mcp`, `init`, `viz`, `export`, `version`, `upgrade`, `completions`, and `cache`.
+- User-level MCP registration only; repository-local Node hooks and tracked
+  `.claude` wiring removed.
+- Rust source installation from `wallentx/Graft` branch `dev`; npm CLI mapping
+  removed and the TypeScript package made a private differential reference.
+- Stripped release archives with SHA-256 sidecars, isolated install smoke,
+  Termux Bionic-container CI, and an optional real Android/AArch64 runner gate.
+
 ## 0.8.2
 
 ### Fixed

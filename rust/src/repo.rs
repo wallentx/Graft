@@ -10,11 +10,19 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[derive(Debug, Clone)]
+pub struct Target {
+    pub label: String,
+    pub root: PathBuf,
+}
+
 /// Languages the extractor understands, chosen by file extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lang {
     TypeScript,
     Tsx,
+    JavaScript,
+    Rust,
     Python,
     Go,
 }
@@ -27,6 +35,8 @@ impl Lang {
             // names that outrank the real definition.
             "ts" if !p.to_string_lossy().ends_with(".d.ts") => Some(Lang::TypeScript),
             "tsx" => Some(Lang::Tsx),
+            "js" | "mjs" | "cjs" | "jsx" => Some(Lang::JavaScript),
+            "rs" => Some(Lang::Rust),
             "py" => Some(Lang::Python),
             "go" => Some(Lang::Go),
             _ => None,
@@ -40,19 +50,69 @@ impl Lang {
 /// not in a work tree, so graft still indexes a plain directory — it just cannot
 /// share an entry between worktrees of the same repo.
 pub fn root_of(start: &Path) -> Result<PathBuf> {
+    if let Some(root) = git_toplevel(start) {
+        return Ok(root);
+    }
+    std::fs::canonicalize(start).with_context(|| format!("canonicalize {}", start.display()))
+}
+
+fn git_toplevel(start: &Path) -> Option<PathBuf> {
     let out = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(start)
-        .output();
-    if let Ok(o) = out
-        && o.status.success()
-    {
-        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-        if !s.is_empty() {
-            return std::fs::canonicalize(&s).with_context(|| format!("canonicalize {s}"));
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!path.is_empty())
+        .then(|| std::fs::canonicalize(path).ok())
+        .flatten()
+}
+
+/// A git repository, or an immediate workspace containing at least two repos.
+pub fn targets(start: &Path) -> Result<Vec<Target>> {
+    let start = std::fs::canonicalize(start)
+        .with_context(|| format!("canonicalize {}", start.display()))?;
+    if let Some(root) = git_toplevel(&start) {
+        return Ok(vec![Target {
+            label: root
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            root,
+        }]);
+    }
+
+    let mut children = Vec::new();
+    for entry in std::fs::read_dir(&start).with_context(|| format!("read {}", start.display()))? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let child = std::fs::canonicalize(entry.path())?;
+        if git_toplevel(&child).as_deref() == Some(child.as_path()) {
+            children.push(Target {
+                label: entry.file_name().to_string_lossy().into_owned(),
+                root: child,
+            });
         }
     }
-    std::fs::canonicalize(start).with_context(|| format!("canonicalize {}", start.display()))
+    children.sort_by(|left, right| left.label.cmp(&right.label));
+    if children.len() >= 2 {
+        Ok(children)
+    } else {
+        Ok(vec![Target {
+            label: start
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            root: start,
+        }])
+    }
 }
 
 /// `git rev-parse --git-common-dir`, which is shared by every worktree of a repo.
@@ -165,11 +225,15 @@ mod tests {
         assert_eq!(Lang::of_path(Path::new("a/b.ts")), Some(Lang::TypeScript));
         assert_eq!(Lang::of_path(Path::new("a/b.tsx")), Some(Lang::Tsx));
         assert_eq!(
+            Lang::of_path(Path::new("scripts/build.mjs")),
+            Some(Lang::JavaScript)
+        );
+        assert_eq!(Lang::of_path(Path::new("src/main.rs")), Some(Lang::Rust));
+        assert_eq!(
             Lang::of_path(Path::new("a/b.d.ts")),
             None,
             ".d.ts has no bodies to index"
         );
-        assert_eq!(Lang::of_path(Path::new("a/b.js")), None);
         assert_eq!(Lang::of_path(Path::new("README.md")), None);
     }
 
@@ -191,5 +255,39 @@ mod tests {
             16,
             "zero-padded, so hashes sort as text"
         );
+    }
+
+    #[test]
+    fn workspace_requires_two_immediate_git_children() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "graft-workspace-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for child in ["alpha", "beta"] {
+            let path = root.join(child);
+            std::fs::create_dir_all(&path).unwrap();
+            assert!(
+                Command::new("git")
+                    .arg("init")
+                    .arg("-q")
+                    .arg(&path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let found = targets(&root).unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|target| target.label.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

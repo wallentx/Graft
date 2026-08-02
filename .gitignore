@@ -1,6 +1,8 @@
 node_modules/
 dist/
 rust/target/
+/target/
+/release/
 *.log
 
 # graft's local graph cache — regenerable, not committed. Each dev runs
@@ -17,3 +19,8 @@ graft/
 
 # Session transcripts and prompt traces — local analysis, not product.
 transcripts/
+
+# Agent-host integration is machine/user state. `graft init` writes only to
+# user-level host configuration; never commit generated local host wiring.
+/.claude/
+/.codegraph/

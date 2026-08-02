@@ -10,23 +10,27 @@
 //! rather than another arm in a recursive match.
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Parser, Query, QueryCursor};
 
 use crate::repo::Lang;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Symbol {
     pub name: String,
     pub kind: String,
     pub start_line: i64,
     pub end_line: i64,
     pub signature: String,
+    /// Definition body used by lexical retrieval. Capped to bound store growth.
+    #[serde(default)]
+    pub search_text: String,
 }
 
 /// A call site whose target is a bare name, not yet tied to a symbol row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallIntent {
     /// Index into the file's symbol list — the symbol the call appears inside.
     /// None for a top-level call, which belongs to the file itself: a module-level
@@ -39,7 +43,7 @@ pub struct CallIntent {
 }
 
 /// A variable, parameter or field bound to a type name.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Binding {
     /// Symbol the binding is scoped to; None at module level.
     pub owner: Option<usize>,
@@ -47,6 +51,7 @@ pub struct Binding {
     pub ty: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Extracted {
     pub symbols: Vec<Symbol>,
     pub calls: Vec<CallIntent>,
@@ -144,6 +149,12 @@ const PY_BINDINGS: &str = r#"
   right: (call function: (identifier) @ty))
 "#;
 
+const PY_FIELD_ALIASES: &str = r#"
+(assignment
+  left: (attribute object: (identifier) @object attribute: (identifier) @field)
+  right: (identifier) @source)
+"#;
+
 const PY_IMPORTS: &str = r#"
 (import_statement name: (dotted_name) @spec)
 (import_from_statement module_name: [(dotted_name) (relative_import)] @spec)
@@ -182,9 +193,34 @@ const GO_IMPORTS: &str = r#"
 (import_spec path: (interpreted_string_literal) @spec)
 "#;
 
+const RUST_DEFS: &str = r#"
+(function_item name: (identifier) @name) @def
+(struct_item name: (type_identifier) @name) @def
+(enum_item name: (type_identifier) @name) @def
+(trait_item name: (type_identifier) @name) @def
+(type_item name: (type_identifier) @name) @def
+(mod_item name: (identifier) @name) @def
+"#;
+
+const RUST_CALLS: &str = r#"
+(call_expression function: (identifier) @callee)
+(call_expression function: (field_expression value: (_) @recv field: (field_identifier) @callee))
+(call_expression function: (scoped_identifier path: (_) @recv name: (identifier) @callee))
+"#;
+
+const RUST_BINDINGS: &str = r#"
+(let_declaration pattern: (identifier) @name type: (_) @ty)
+(parameter pattern: (identifier) @name type: (_) @ty)
+"#;
+
+const RUST_IMPORTS: &str = r#"
+(use_declaration argument: (_) @spec)
+(mod_item name: (identifier) @spec)
+"#;
+
 fn queries(lang: Lang) -> Queries {
     match lang {
-        Lang::TypeScript | Lang::Tsx => Queries {
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => Queries {
             defs: TS_DEFS,
             calls: TS_CALLS,
             bindings: TS_BINDINGS,
@@ -202,15 +238,22 @@ fn queries(lang: Lang) -> Queries {
             bindings: GO_BINDINGS,
             imports: GO_IMPORTS,
         },
+        Lang::Rust => Queries {
+            defs: RUST_DEFS,
+            calls: RUST_CALLS,
+            bindings: RUST_BINDINGS,
+            imports: RUST_IMPORTS,
+        },
     }
 }
 
 fn language(lang: Lang) -> tree_sitter::Language {
     match lang {
-        Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        Lang::TypeScript | Lang::JavaScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
         Lang::Python => tree_sitter_python::LANGUAGE.into(),
         Lang::Go => tree_sitter_go::LANGUAGE.into(),
+        Lang::Rust => tree_sitter_rust::LANGUAGE.into(),
     }
 }
 
@@ -225,8 +268,44 @@ fn kind_of(n: &Node) -> &'static str {
         "type_alias_declaration" => "type",
         "enum_declaration" => "enum",
         "method_definition" => "method",
+        "struct_item" => "struct",
+        "enum_item" => "enum",
+        "trait_item" => "trait",
+        "type_item" => "type",
+        "mod_item" => "namespace",
         _ => "function",
     }
+}
+
+fn type_basename(text: &str) -> String {
+    let before_generics = text.trim().split('<').next().unwrap_or(text).trim();
+    before_generics
+        .rsplit("::")
+        .next()
+        .unwrap_or(before_generics)
+        .split_whitespace()
+        .last()
+        .unwrap_or(before_generics)
+        .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_')
+        .to_string()
+}
+
+fn rust_container_of(node: Node<'_>, src: &str) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "impl_item" => {
+                let ty = parent.child_by_field_name("type")?;
+                return Some(type_basename(&src[ty.byte_range()]));
+            }
+            "trait_item" => {
+                let name = parent.child_by_field_name("name")?;
+                return Some(src[name.byte_range()].to_string());
+            }
+            _ => current = parent.parent(),
+        }
+    }
+    None
 }
 
 /// First line of the definition, trimmed — enough to identify a symbol without
@@ -246,6 +325,19 @@ fn signature_of(src: &str, n: &Node) -> String {
         s.push('…');
     }
     s
+}
+
+fn search_text_of(src: &str, node: &Node<'_>) -> String {
+    const MAX_BYTES: usize = 32 * 1024;
+    let text = &src[node.byte_range()];
+    if text.len() <= MAX_BYTES {
+        return text.to_string();
+    }
+    let mut end = MAX_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
@@ -291,19 +383,30 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
         let (Some(name_node), Some(def_node)) = (name_node, def_node) else {
             continue;
         };
+        let rust_container = if lang == Lang::Rust && def_node.kind() == "function_item" {
+            rust_container_of(def_node, src)
+        } else {
+            None
+        };
         symbols.push(Symbol {
             name: src[name_node.byte_range()].to_string(),
-            kind: kind_of(&def_node).to_string(),
+            kind: if rust_container.is_some() {
+                "method".to_string()
+            } else {
+                kind_of(&def_node).to_string()
+            },
             // tree-sitter rows are 0-based; every display surface is 1-based.
             start_line: def_node.start_position().row as i64 + 1,
             end_line: def_node.end_position().row as i64 + 1,
             signature: signature_of(src, &def_node),
+            search_text: search_text_of(src, &def_node),
         });
         spans.push((def_node.start_byte(), def_node.end_byte()));
         recv_types.push(
             recvty_idx
                 .and_then(|i| m.captures.iter().find(|c| c.index == i))
-                .map(|c| src[c.node.byte_range()].to_string()),
+                .map(|c| src[c.node.byte_range()].to_string())
+                .or(rust_container),
         );
         recv_names.push(
             recvname_idx
@@ -429,7 +532,12 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
         let Some(ty_node) = m.captures.iter().find(|c| c.index == b_ty).map(|c| c.node) else {
             continue;
         };
-        let ty = src[ty_node.byte_range()].to_string();
+        let raw_ty = &src[ty_node.byte_range()];
+        let ty = if lang == Lang::Rust {
+            type_basename(raw_ty)
+        } else {
+            raw_ty.to_string()
+        };
 
         // A class field binds `this.<field>` and is scoped to the class, so a
         // method body's `this.repo.scan()` finds it. A plain variable or parameter
@@ -446,6 +554,60 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
             bindings.push(Binding {
                 owner: owner_at(at),
                 name: src[n.node.byte_range()].to_string(),
+                ty,
+            });
+        }
+    }
+
+    // Propagate an annotated parameter into a self field:
+    // `def __init__(self, store: Store): self.store = store`.
+    if lang == Lang::Python {
+        let alias_q =
+            Query::new(&ts_lang, PY_FIELD_ALIASES).context("compile Python field-alias query")?;
+        let object_idx = alias_q
+            .capture_index_for_name("object")
+            .context("alias query lacks @object")?;
+        let field_idx = alias_q
+            .capture_index_for_name("field")
+            .context("alias query lacks @field")?;
+        let source_idx = alias_q
+            .capture_index_for_name("source")
+            .context("alias query lacks @source")?;
+        let mut aliases = Vec::new();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&alias_q, root, src.as_bytes());
+        while let Some(m) = matches.next() {
+            let captured = |index| {
+                m.captures
+                    .iter()
+                    .find(|capture| capture.index == index)
+                    .map(|capture| capture.node)
+            };
+            let (Some(object), Some(field), Some(source)) = (
+                captured(object_idx),
+                captured(field_idx),
+                captured(source_idx),
+            ) else {
+                continue;
+            };
+            if &src[object.byte_range()] != "self" {
+                continue;
+            }
+            aliases.push((field, source));
+        }
+        for (field, source) in aliases {
+            let scope = owner_at(field.start_byte());
+            let source_name = &src[source.byte_range()];
+            let Some(ty) = bindings
+                .iter()
+                .find(|binding| binding.owner == scope && binding.name == source_name)
+                .map(|binding| binding.ty.clone())
+            else {
+                continue;
+            };
+            bindings.push(Binding {
+                owner: class_at(field.start_byte()),
+                name: format!("this.{}", &src[field.byte_range()]),
                 ty,
             });
         }
@@ -607,6 +769,17 @@ function helper(): void {}
         assert_eq!(e.symbols.len(), 1);
         assert_eq!(e.symbols[0].name, "App");
     }
+
+    #[test]
+    fn javascript_family_reuses_typescript_grammar() {
+        let e = extract(
+            Lang::JavaScript,
+            "export function buildViewer() { helper(); }",
+        )
+        .unwrap();
+        assert!(e.symbols.iter().any(|symbol| symbol.name == "buildViewer"));
+        assert!(e.calls.iter().any(|call| call.callee == "helper"));
+    }
 }
 
 #[cfg(test)]
@@ -700,6 +873,22 @@ def main():
     }
 
     #[test]
+    fn python_propagates_annotated_parameter_into_self_field() {
+        let e = extract(
+            Lang::Python,
+            "class S:\n    def __init__(self, store: Store):\n        self.store = store\n",
+        )
+        .unwrap();
+        assert!(
+            e.bindings
+                .iter()
+                .any(|binding| binding.name == "this.store" && binding.ty == "Store"),
+            "{:?}",
+            e.bindings
+        );
+    }
+
+    #[test]
     fn go_definitions_and_method_receivers() {
         let src = r#"
 package main
@@ -758,5 +947,52 @@ func main() {
             e.containers[e.symbols.iter().position(|s| s.name == "Run").unwrap()].as_deref(),
             Some("Worker")
         );
+    }
+
+    #[test]
+    fn rust_definitions_methods_calls_bindings_and_imports() {
+        let src = r#"
+use crate::db::helper;
+
+struct Store;
+struct Other;
+
+impl Store {
+    fn fetch(&self) {}
+    fn run(&self, other: Other) {
+        self.fetch();
+        helper();
+        consume(other);
+    }
+}
+
+fn consume(_: Other) {}
+"#;
+        let e = extract(Lang::Rust, src).unwrap();
+        let names: Vec<_> = e
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.name.as_str(), symbol.kind.as_str()))
+            .collect();
+        assert!(names.contains(&("Store", "struct")), "{names:?}");
+        assert!(names.contains(&("fetch", "method")), "{names:?}");
+        assert!(names.contains(&("run", "method")), "{names:?}");
+        let run = e
+            .symbols
+            .iter()
+            .position(|symbol| symbol.name == "run")
+            .unwrap();
+        assert_eq!(e.containers[run].as_deref(), Some("Store"));
+        assert!(
+            e.calls
+                .iter()
+                .any(|call| call.callee == "fetch" && call.receiver.as_deref() == Some("self"))
+        );
+        assert!(
+            e.bindings
+                .iter()
+                .any(|binding| binding.name == "other" && binding.ty == "Other")
+        );
+        assert_eq!(e.imports, ["crate::db::helper"]);
     }
 }

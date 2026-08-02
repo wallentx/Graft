@@ -1,0 +1,36 @@
+name: Native Termux smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android-aarch64:
+    # A runner registered from the Termux app with all three labels. This is the
+    # real Android/Bionic gate; termux-docker in CI is useful but cannot emulate
+    # Android's kernel and complete public-library surface.
+    runs-on: [self-hosted, termux, ARM64]
+    steps:
+      - name: Fetch exact revision without Node-based actions
+        env:
+          REVISION: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -eu
+          git init .
+          git remote remove origin 2>/dev/null || true
+          git remote add origin "https://github.com/$REPOSITORY.git"
+          git fetch --depth=1 origin "$REVISION"
+          git checkout --detach FETCH_HEAD
+
+      - name: Native Android build and isolated install smoke
+        run: |
+          set -eu
+          pkg install -y rust clang make git pkg-config
+          cargo test --workspace --all-targets --locked
+          prefix="$TMPDIR/graft-prefix-$GITHUB_RUN_ID"
+          cargo install --path rust --locked --root "$prefix"
+          "$prefix/bin/graft" --version
+          "$prefix/bin/graft" version --json

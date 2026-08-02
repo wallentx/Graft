@@ -2,93 +2,116 @@ name: CI
 
 on:
   push:
-    branches: [dev]
+    branches: [dev, wallentx/rust]
   pull_request:
-    branches: [dev]
+    branches: [dev, wallentx/rust]
 
 permissions:
   contents: read
 
 jobs:
-  test:
+  rust:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # package.json declares engines.node >=20; test the range we claim,
-        # not just its floor.
-        node-version: ['20', '22', '24']
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
 
-      - name: Setup Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: ${{ matrix.node-version }}
-          cache: npm
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Format
+        run: cargo fmt --all --check
 
       - name: Test
-        run: npm test
+        run: cargo test --workspace --all-targets --locked
 
-  # The README tells people to install this fork with
-  #   npm install -g 'git+https://github.com/wallentx/Graft.git#dev'
-  # which is a different code path from `npm ci`: it runs `prepare` (a full
-  # tsc + viewer build) inside npm's git clone, compiles the tree-sitter native
-  # addons, and wires the `graft` bin's shebang. `npm test` exercises none of
-  # that. Installing from the local .git reproduces it without the network.
-  install-smoke:
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  release-smoke:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-          fetch-depth: 0 # npm must be able to resolve the committish below
+
+      - name: Install into isolated prefix
+        run: cargo install --path rust --locked --root "$RUNNER_TEMP/graft-prefix"
+
+      - name: Exercise every command and an indexed fixture
+        env:
+          GRAFT_BIN: ${{ runner.temp }}/graft-prefix/bin/graft
+          GRAFT_STORE: ${{ runner.temp }}/graft-smoke.db
+          GRAFT_HOME: ${{ runner.temp }}/graft-home
+        run: |
+          set -euxo pipefail
+          "$GRAFT_BIN" --version
+          for command in build ask grep callers skeleton map mcp init check export completions cache version upgrade viz status; do
+            "$GRAFT_BIN" "$command" --help >/dev/null
+          done
+          smoke=$(mktemp -d)
+          mkdir -p "$smoke/src" "$GRAFT_HOME"
+          printf '%s\n' 'export function greet(name: string) { return "hello " + name; }' 'export function main() { return greet("world"); }' > "$smoke/src/a.ts"
+          git -C "$smoke" init -q
+          "$GRAFT_BIN" --store "$GRAFT_STORE" build "$smoke"
+          "$GRAFT_BIN" --store "$GRAFT_STORE" ask greet "$smoke" --json
+          "$GRAFT_BIN" --store "$GRAFT_STORE" grep greet --path "$smoke" --json
+          "$GRAFT_BIN" --store "$GRAFT_STORE" callers greet --path "$smoke" --json
+          "$GRAFT_BIN" --store "$GRAFT_STORE" skeleton a.ts --path "$smoke" --json
+          "$GRAFT_BIN" --store "$GRAFT_STORE" map "$smoke" --json
+          "$GRAFT_BIN" --store "$GRAFT_STORE" check "$smoke" --json
+          "$GRAFT_BIN" --store "$GRAFT_STORE" status "$smoke" --json
+          "$GRAFT_BIN" --store "$GRAFT_STORE" export "$RUNNER_TEMP/export.json" --path "$smoke" --json
+          "$GRAFT_BIN" --store "$GRAFT_STORE" viz "$smoke" --output "$RUNNER_TEMP/map.html"
+          HOME="$GRAFT_HOME" "$GRAFT_BIN" init --host codex --dry-run --json
+          test ! -e "$GRAFT_HOME/.codex/config.toml"
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | "$GRAFT_BIN" --store "$GRAFT_STORE" mcp "$smoke" | grep -q '"tools"'
+          "$GRAFT_BIN" --store "$GRAFT_STORE" grep greet --path "$smoke" | head -n 1 >/dev/null
+
+  termux-container:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Build and run in Termux Bionic userland
+        run: |
+          set -euxo pipefail
+          docker run --rm -v "$GITHUB_WORKSPACE:/workspace" -w /workspace termux/termux-docker:latest bash -lc "
+            set -eu
+            pkg update -y
+            pkg install -y rust clang make git pkg-config
+            cargo test --workspace --all-targets --locked
+            cargo build --workspace --release --locked
+            file target/release/graft
+            target/release/graft --version
+            target/release/graft version --json
+          "
+
+  legacy-typescript-reference:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20'
+          cache: npm
 
-      - name: Install globally from git, exactly as the README prescribes
-        run: npm install -g "git+file://${GITHUB_WORKSPACE}/.git#${GITHUB_SHA}"
+      - name: Test reference implementation
+        run: npm ci && npm test
 
-      - name: The installed bin runs (catches a broken shebang or bin mapping)
+      - name: TypeScript-to-Rust semantic differential
         run: |
-          set -euxo pipefail
-          command -v graft
-          graft --version
-
-      - name: Build a graph end to end (exercises the native tree-sitter addons)
-        run: |
-          set -euxo pipefail
-          smoke="$(mktemp -d)"
-          mkdir -p "$smoke/src"
-          cat > "$smoke/src/a.ts" <<'TS'
-          export function greet(name: string): string {
-            return `hello ${name}`;
-          }
-          export function main(): string {
-            return greet('world');
-          }
-          TS
-          git -C "$smoke" init -q
-          git -C "$smoke" add -A
-          git -C "$smoke" -c user.email=ci@example.com -c user.name=CI commit -qm init
-          graft build "$smoke"
-          graft ask 'greet' --in "$smoke" || graft ask 'greet'
-          graft callers greet
-        working-directory: ${{ runner.temp }}
-
-      - name: init --dry-run writes nothing
-        run: |
-          set -euxo pipefail
-          dry="$(mktemp -d)"
-          graft init "$dry" --dry-run --agents claude
-          test -z "$(ls -A "$dry")" || { echo "--dry-run wrote files:"; ls -Ra "$dry"; exit 1; }
+          npm run build
+          cargo build --workspace --locked
+          sh scripts/differential.sh

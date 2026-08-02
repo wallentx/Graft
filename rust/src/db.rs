@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped whenever the DDL below changes in a way an existing store cannot serve.
 /// Read from and written to `pragma user_version`.
-const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 const DDL: &str = r#"
 create table if not exists repos (
@@ -45,6 +45,15 @@ create table if not exists files (
   size     integer not null,
   hash     text    not null,
   unique (repo_id, path)
+);
+
+-- Parsed extraction payload for incremental builds. Symbol rows remain the
+-- query surface; this cache retains unresolved calls/imports/bindings so edges
+-- can be rebuilt repo-wide without reparsing unchanged source files.
+create table if not exists file_extracts (
+  file_id          integer primary key references files(id) on delete cascade,
+  extractor_stamp  text    not null,
+  payload           text    not null
 );
 
 create table if not exists symbols (
@@ -124,6 +133,7 @@ pub fn open(path: &Path) -> Result<Connection> {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let db = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+    db.busy_timeout(std::time::Duration::from_secs(5))?;
 
     // WAL so a query can read while a build writes. `journal_mode` returns the
     // mode actually in force, which is not necessarily the one requested — a
@@ -138,15 +148,61 @@ pub fn open(path: &Path) -> Result<Connection> {
 
     let found: i64 = db.query_row("pragma user_version", [], |r| r.get(0))?;
     anyhow::ensure!(
-        found == 0 || found == SCHEMA_VERSION,
-        "store at {} is schema v{found}, this build speaks v{SCHEMA_VERSION}",
+        matches!(found, 0 | 3 | SCHEMA_VERSION),
+        "store at {} is schema v{found}; supported migrations are v3 -> v{SCHEMA_VERSION}",
         path.display()
     );
     db.execute_batch(DDL).context("apply schema")?;
-    if found == 0 {
+    if found != SCHEMA_VERSION {
         db.execute_batch(&format!("pragma user_version={SCHEMA_VERSION}"))?;
     }
     Ok(db)
+}
+
+pub fn reset_repo(db: &Connection, root: &Path) -> Result<bool> {
+    Ok(db.execute("delete from repos where root=?1", [root.to_string_lossy()])? > 0)
+}
+
+pub fn prune_missing(db: &Connection) -> Result<Vec<String>> {
+    let mut statement = db.prepare("select root from repos order by root")?;
+    let roots = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    let missing: Vec<String> = roots
+        .into_iter()
+        .filter(|root| !Path::new(root).exists())
+        .collect();
+    for root in &missing {
+        db.execute("delete from repos where root=?1", [root])?;
+    }
+    Ok(missing)
+}
+
+pub fn integrity(db: &Connection) -> Result<String> {
+    db.query_row("pragma integrity_check", [], |row| row.get(0))
+        .context("run SQLite integrity check")
+}
+
+/// Preserve a broken store beside the replacement. Recovery never destroys the
+/// only copy an operator might need for diagnosis.
+pub fn recover(path: &Path) -> Result<PathBuf> {
+    anyhow::ensure!(path.exists(), "{} does not exist", path.display());
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let backup = path.with_extension(format!("corrupt-{timestamp}.db"));
+    std::fs::rename(path, &backup)
+        .with_context(|| format!("preserve corrupt store as {}", backup.display()))?;
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{suffix}", path.display()));
+        if sidecar.exists() {
+            let backup_sidecar = PathBuf::from(format!("{}{suffix}", backup.display()));
+            std::fs::rename(sidecar, backup_sidecar)?;
+        }
+    }
+    open(path).context("create replacement store")?;
+    Ok(backup)
 }
 
 #[cfg(test)]
@@ -222,6 +278,73 @@ mod tests {
         assert_eq!(v, SCHEMA_VERSION);
         drop(db);
         open(&p).expect("re-opening an existing store must not fail");
+    }
+
+    #[test]
+    fn migrates_v3_store_without_dropping_repo_rows() {
+        let g = tempdir::Guard::new();
+        let p = g.path().join("graft.db");
+        let db = open(&p).unwrap();
+        seed_repo(&db);
+        db.execute_batch("drop table file_extracts; pragma user_version=3;")
+            .unwrap();
+        drop(db);
+
+        let db = open(&p).unwrap();
+        let repos: i64 = db
+            .query_row("select count(*) from repos", [], |r| r.get(0))
+            .unwrap();
+        let cache_table: i64 = db
+            .query_row(
+                "select count(*) from sqlite_master where type='table' and name='file_extracts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(repos, 1, "migration must preserve indexed repositories");
+        assert_eq!(cache_table, 1, "migration must create extraction cache");
+    }
+
+    #[test]
+    fn wal_reader_sees_committed_state_while_writer_is_open() {
+        let g = tempdir::Guard::new();
+        let path = g.path().join("graft.db");
+        let mut writer = open(&path).unwrap();
+        let reader = open(&path).unwrap();
+        let tx = writer.transaction().unwrap();
+        tx.execute(
+            "insert into repos(root, indexed_at, extractor_stamp) values ('/pending', 1, 'x')",
+            [],
+        )
+        .unwrap();
+        let before: i64 = reader
+            .query_row("select count(*) from repos", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, 0);
+        tx.commit().unwrap();
+        let after: i64 = reader
+            .query_row("select count(*) from repos", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after, 1);
+    }
+
+    #[test]
+    fn dropped_transaction_leaves_no_partial_repo() {
+        let g = tempdir::Guard::new();
+        let path = g.path().join("graft.db");
+        let mut db = open(&path).unwrap();
+        {
+            let tx = db.transaction().unwrap();
+            tx.execute(
+                "insert into repos(root, indexed_at, extractor_stamp) values ('/partial', 1, 'x')",
+                [],
+            )
+            .unwrap();
+        }
+        let count: i64 = db
+            .query_row("select count(*) from repos", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]
