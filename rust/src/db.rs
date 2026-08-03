@@ -163,6 +163,14 @@ pub fn reset_repo(db: &Connection, root: &Path) -> Result<bool> {
     Ok(db.execute("delete from repos where root=?1", [root.to_string_lossy()])? > 0)
 }
 
+/// Remove every indexed repository while preserving a valid, reusable store.
+pub fn clear(db: &Connection) -> Result<i64> {
+    let repositories: i64 = db.query_row("select count(*) from repos", [], |row| row.get(0))?;
+    db.execute("delete from repos", [])?;
+    db.execute_batch("pragma wal_checkpoint(truncate); vacuum;")?;
+    Ok(repositories)
+}
+
 pub fn prune_missing(db: &Connection) -> Result<Vec<String>> {
     let mut statement = db.prepare("select root from repos order by root")?;
     let roots = statement
@@ -424,6 +432,23 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 0, "fts must not outlive the symbols it indexes");
+    }
+
+    #[test]
+    fn clear_removes_all_graph_rows_and_keeps_the_store_usable() {
+        let (_g, db) = temp_db();
+        seed_repo(&db);
+        assert_eq!(clear(&db).unwrap(), 1);
+        for table in ["repos", "files", "file_extracts", "symbols", "edges"] {
+            let rows: i64 = db
+                .query_row(&format!("select count(*) from {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 0, "{table} should be empty");
+        }
+        assert_eq!(integrity(&db).unwrap(), "ok");
+        seed_repo(&db);
     }
 
     #[test]

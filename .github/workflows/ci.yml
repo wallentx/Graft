@@ -68,8 +68,19 @@ jobs:
           "$GRAFT_BIN" --store "$GRAFT_STORE" viz "$smoke" --output "$RUNNER_TEMP/map.html"
           HOME="$GRAFT_HOME" "$GRAFT_BIN" init --provider codex --dry-run --json
           test ! -e "$GRAFT_HOME/.codex/config.toml"
+          HOME="$GRAFT_HOME" "$GRAFT_BIN" init --provider codex
+          grep -q '\[mcp_servers.graft\]' "$GRAFT_HOME/.codex/config.toml"
+          HOME="$GRAFT_HOME" "$GRAFT_BIN" init --provider codex --deregister
+          if grep -q '\[mcp_servers.graft\]' "$GRAFT_HOME/.codex/config.toml"; then
+            exit 1
+          fi
           printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | "$GRAFT_BIN" --store "$GRAFT_STORE" mcp "$smoke" | grep -q '"tools"'
           "$GRAFT_BIN" --store "$GRAFT_STORE" grep greet --path "$smoke" | head -n 1 >/dev/null
+          "$GRAFT_BIN" --store "$GRAFT_STORE" cache clear --yes
+          printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"status","arguments":{}}}' | "$GRAFT_BIN" --store "$GRAFT_STORE" mcp "$smoke" | grep -q '"indexed":true'
+          printf '%s\n' 'export function added() { return greet("again"); }' >> "$smoke/src/a.ts"
+          printf '%s\n' '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"find","arguments":{"query":"added"}}}' | "$GRAFT_BIN" --store "$GRAFT_STORE" mcp "$smoke" | grep -q 'added'
+          "$GRAFT_BIN" --store "$GRAFT_STORE" cache doctor
 
   termux-container:
     runs-on: ubuntu-latest

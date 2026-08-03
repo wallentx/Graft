@@ -99,7 +99,22 @@ git pull --ff-only origin dev
 ./install.sh
 ```
 
-Remove an installation made under the default root:
+For a complete uninstall, first run the provider picker and uncheck every
+registered provider. This removes only Graft's MCP entries and preserves all
+other provider settings:
+
+```sh
+graft init
+```
+
+Optionally remove every indexed graph and reclaim the database space. Source
+repositories are never touched:
+
+```sh
+graft cache clear --yes
+```
+
+Then remove an installation made under the default root:
 
 ```sh
 cargo uninstall --root "$HOME/.local" graft
@@ -116,20 +131,23 @@ graft init
 ```text
 Select providers (space toggles, enter confirms)
 > [ ] Claude Code           ~/.claude.json
-  [x] Codex                 ~/.codex/config.toml             detected
+  [x] Codex                 ~/.codex/config.toml             registered
   [ ] Cursor                ~/.cursor/mcp.json
 ```
 
-Detected providers start checked. Move with the arrow keys, toggle with space,
-and apply the selection with enter. Graft merges an MCP entry named `graft` into
-each selected user configuration. Existing unrelated entries are preserved,
-invalid JSON is refused, and writes are private and atomic.
+Only providers containing an actual Graft registration start checked. Installed
+providers without one are labelled `detected` but remain unchecked. Move with
+the arrow keys, toggle with space, and apply the selection with enter. Checking
+a provider registers or refreshes Graft; unchecking a registered provider
+deregisters it. Existing unrelated entries are preserved, invalid JSON is
+refused, and writes are private and atomic.
 
 For scripts or headless machines, repeat `--provider` instead of opening the
 picker:
 
 ```sh
 graft init --provider codex --provider claude
+graft init --provider claude --deregister
 graft init --provider cursor --dry-run
 graft init --provider opencode --dry-run --json
 ```
@@ -167,11 +185,17 @@ TypeScript declaration files. Subsequent builds reuse unchanged extraction
 payloads. Large cold builds use at most four parser workers; use `--jobs 1` or
 `GRAFT_JOBS=1` on a memory-constrained device.
 
-Normal CLI query commands refresh a stale index before answering. `check` and
-`status` are observational: they report drift without repairing it. MCP refuses
-stale or unindexed data rather than silently returning an incomplete graph. Use
-global `--no-refresh` or `GRAFT_NO_REFRESH=1` when an intentional stored snapshot
-is required.
+After provider registration, MCP automatically indexes the repository on its
+first normal tool call and incrementally refreshes changed source before later
+answers. The MCP `freshness` tool is observational and does not trigger a build.
+This makes Graft available in any repository opened by a registered provider;
+running `graft build` first is optional unless you want to pre-warm the index.
+
+Normal CLI query commands refresh an existing stale index before answering;
+their initial index is still created explicitly with `graft build`. CLI `check`
+and `status` are observational. Use global `--no-refresh` or
+`GRAFT_NO_REFRESH=1` to disable MCP lazy indexing and all automatic refreshes
+when an intentional stored snapshot is required.
 
 ## Commands
 
@@ -189,6 +213,7 @@ is required.
 | `mcp [path]` | Serve newline-delimited MCP JSON-RPC over stdin/stdout |
 | `check [path]` | Fail when an index is missing, stale, or incompatible |
 | `status [path]` | Report graph counts, age, schema, extractor, and source drift |
+| `cache clear --yes` | Remove all indexed graphs and reclaim database space |
 | `cache prune` | Remove records for repository paths that no longer exist |
 | `cache doctor` | Run SQLite's full integrity check |
 | `cache recover` | Preserve a damaged store and create a clean replacement |

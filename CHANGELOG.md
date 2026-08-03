@@ -12,7 +12,15 @@
 - Replaced the required `init` provider argument with an interactive checkbox
   picker and repeatable `--provider` flags for non-interactive setup. Added an
   inspect-first local installer that defaults to `~/.local` and never fetches
-  Graft itself.
+  Graft itself. After selection, normal output lists only the configuration files
+  written; the picker's internal selection report is suppressed. Checked state
+  now reflects actual Graft registrations, and unchecking safely deregisters
+  Graft while preserving other provider entries.
+- Added `cache clear --yes` to remove all indexed graphs, reclaim store space,
+  and leave a valid empty database for reuse.
+- MCP now lazily indexes repositories on first use and incrementally refreshes
+  changed source. `freshness` remains observational, while `--no-refresh` and
+  `GRAFT_NO_REFRESH=1` preserve an explicit stored-snapshot mode.
 - Rust source installation from `wallentx/Graft` branch `dev`; completed the
   native-only cutover by removing the npm CLI mapping, legacy TypeScript package,
   tests, D3 viewer, Node scripts, differential harness, and unreferenced media.

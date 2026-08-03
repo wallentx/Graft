@@ -26,13 +26,15 @@ Native Rust rewrite status after local cutover work on `wallentx/rust`.
 - [x] Immediate-child multi-repository workspace detection and federation for
   build/query/check/MCP, with labels and fair interleaving for ranked results.
 - [x] Bounded newline-delimited MCP JSON-RPC with initialize, ping, tool schemas,
-  structured errors, stale/unindexed refusal, and 1 MiB request/response limits.
+  structured errors, lazy first-use indexing, incremental freshness repair,
+  read-only opt-out, and 1 MiB request/response limits.
 - [x] MCP tools for find, grep, callers, skeleton, map, status, and freshness.
-- [x] Interactive checkbox provider selection plus repeatable `--provider`,
-  `init --dry-run`, and registration for Claude Code, Codex, Cursor, Gemini CLI,
-  Antigravity, OpenCode, and Copilot CLI using the installed binary's absolute
-  path. Existing JSON is merged; invalid JSON is never overwritten; writes are
-  private and atomic.
+- [x] Interactive checkbox reconciliation based on actual Graft registrations,
+  plus repeatable `--provider`, scripted `--deregister`, `init --dry-run`, and
+  registration for Claude Code, Codex, Cursor, Gemini CLI, Antigravity, OpenCode,
+  and Copilot CLI using the installed binary's absolute path. Unchecking removes
+  only Graft's entry; unrelated settings are preserved. Invalid JSON is never
+  overwritten; writes are private and atomic.
 - [x] Self-contained loopback-only-by-default Rust HTML viewer and explicit HTML
   export.
 - [x] Deterministic Markdown-card/`INDEX.md` and JSON exports to explicit paths.
@@ -54,7 +56,7 @@ Native Rust rewrite status after local cutover work on `wallentx/rust`.
   ranked retrieval and call traversal; the obsolete harness was then removed.
 - [x] Native Termux release built and validated locally: AArch64 Android ELF,
   `/system/bin/linker64`, Android API 24, stripped; archive checksum verified.
-- [x] Native local suite: 52 Rust tests, rustfmt, clippy `-D warnings`, actionlint,
+- [x] Native local suite: 58 Rust tests, rustfmt, clippy `-D warnings`, actionlint,
   shellcheck, release smoke, and MCP smoke. Pre-cutover differential smoke also
   passed before removal of the legacy implementation.
 - [x] Removed obsolete TypeScript sources/tests/viewer, npm metadata, Node-only
@@ -75,9 +77,8 @@ Native Rust rewrite status after local cutover work on `wallentx/rust`.
   same-name hubs.
 - Linked Git worktrees keep separate source rows because their checked-out files
   can differ. `git_common_dir` is recorded for diagnosis only.
-- No repository-local agent instructions or background edit hooks. Query-time
-  freshness replaces hooks and keeps global instructions silent outside indexed
-  repositories.
+- No repository-local agent instructions or background edit hooks. MCP lazily
+  indexes the active repository and query-time freshness replaces hooks.
 - No self-updater or downloaded installer execution. Updates stay under Cargo,
   Git, or a release manager.
 - No ASCII-mode flag. JSON contains data-only strings; human output uses a small

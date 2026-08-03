@@ -1,4 +1,4 @@
-//! Bounded newline-delimited JSON-RPC server for MCP clients.
+//! Bounded newline-delimited JSON-RPC server with lazy repository indexing.
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
@@ -10,7 +10,7 @@ use crate::{ask, db, index, repo};
 const MAX_MESSAGE: usize = 1024 * 1024;
 const MAX_OUTPUT: usize = 1024 * 1024;
 
-pub fn serve(store: &Path, start: &Path) -> Result<()> {
+pub fn serve(store: &Path, start: &Path, no_refresh: bool) -> Result<()> {
     let targets = repo::targets(start)?;
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
@@ -37,7 +37,7 @@ pub fn serve(store: &Path, start: &Path) -> Result<()> {
         let response = if !matches!(method, "initialize" | "ping" | "tools/list" | "tools/call") {
             error(id, -32601, &format!("method not found: {method}"))
         } else {
-            match dispatch(store, &targets, method, &params) {
+            match dispatch(store, &targets, method, &params, no_refresh) {
                 Ok(result) => json!({"jsonrpc":"2.0", "id":id, "result":result}),
                 Err(problem) => error(id, -32000, &problem.to_string()),
             }
@@ -66,13 +66,19 @@ fn error(id: Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc":"2.0", "id":id, "error":{"code":code, "message":message}})
 }
 
-fn dispatch(store: &Path, targets: &[repo::Target], method: &str, params: &Value) -> Result<Value> {
+fn dispatch(
+    store: &Path,
+    targets: &[repo::Target],
+    method: &str,
+    params: &Value,
+    no_refresh: bool,
+) -> Result<Value> {
     match method {
         "initialize" => Ok(json!({
             "protocolVersion":"2024-11-05",
             "capabilities":{"tools":{"listChanged":false}},
             "serverInfo":{"name":"graft", "version":env!("CARGO_PKG_VERSION")},
-            "instructions":"Use find for ranked context, grep for exhaustive matches, callers for graph traversal, and freshness before relying on cached data."
+            "instructions":"Use find for ranked context, grep for exhaustive matches, and callers for graph traversal. Graft automatically indexes new repositories and refreshes changed source; freshness is an observational state check."
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tool_schemas()})),
@@ -82,7 +88,7 @@ fn dispatch(store: &Path, targets: &[repo::Target], method: &str, params: &Value
                 .and_then(Value::as_str)
                 .context("missing tool name")?;
             let args = params.get("arguments").unwrap_or(&Value::Null);
-            let data = call_tool(store, targets, name, args)?;
+            let data = call_tool(store, targets, name, args, no_refresh)?;
             Ok(json!({
                 "content":[{"type":"text", "text":serde_json::to_string_pretty(&data)?}],
                 "structuredContent":data,
@@ -130,27 +136,54 @@ fn schema(name: &str, description: &str, required: &[&str]) -> Value {
     })
 }
 
-fn call_tool(store: &Path, targets: &[repo::Target], name: &str, args: &Value) -> Result<Value> {
+fn call_tool(
+    store: &Path,
+    targets: &[repo::Target],
+    name: &str,
+    args: &Value,
+    no_refresh: bool,
+) -> Result<Value> {
+    match name {
+        "find" => {
+            string_arg(args, "query")?;
+        }
+        "grep" => {
+            string_arg(args, "pattern")?;
+        }
+        "callers" => {
+            string_arg(args, "symbol")?;
+        }
+        "skeleton" => {
+            string_arg(args, "file")?;
+        }
+        "map" | "status" | "freshness" => {}
+        _ => return Err(anyhow!("unknown tool: {name}")),
+    }
     let selected = select_targets(targets, args.get("repo").and_then(Value::as_str))?;
     let mut results = serde_json::Map::new();
     for target in selected {
-        let conn = db::open(store)?;
-        let state = index::freshness(&conn, &target.root)?;
+        let mut conn = db::open(store)?;
+        let mut state = index::freshness(&conn, &target.root)?;
         if name == "freshness" {
             results.insert(target.label.clone(), serde_json::to_value(state)?);
             continue;
         }
         if !state.indexed {
-            return Err(anyhow!(
-                "{} has not been indexed by graft — run `graft build` to index it",
-                target.root.display()
-            ));
-        }
-        if !state.is_clean() {
-            return Err(anyhow!(
-                "{} has a stale graft index — run `graft build`",
-                target.root.display()
-            ));
+            if no_refresh {
+                return Err(anyhow!(
+                    "{} has not been indexed by graft and automatic indexing is disabled",
+                    target.root.display()
+                ));
+            }
+            index::build(&mut conn, &target.root)?;
+            if name == "status" {
+                state = index::freshness(&conn, &target.root)?;
+            }
+        } else if !state.is_clean() && !no_refresh {
+            index::build(&mut conn, &target.root)?;
+            if name == "status" {
+                state = index::freshness(&conn, &target.root)?;
+            }
         }
         let repo_id = index::repo_id_of(&conn, &target.root)?.context("current index missing")?;
         let value = match name {
@@ -200,7 +233,7 @@ fn call_tool(store: &Path, targets: &[repo::Target], name: &str, args: &Value) -
                 "store":index::repo_status(&conn, repo_id)?,
                 "freshness":state,
             }),
-            _ => return Err(anyhow!("unknown tool: {name}")),
+            _ => unreachable!("tool name validated before indexing"),
         };
         results.insert(target.label.clone(), value);
     }
@@ -246,6 +279,41 @@ fn bool_arg_named(args: &Value, name: &str) -> bool {
 mod tests {
     use super::*;
 
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static NEXT: AtomicU32 = AtomicU32::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "graft-mcp-{name}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fixture(name: &str) -> (TempDir, std::path::PathBuf, repo::Target) {
+        let temp = TempDir::new(name);
+        let root = temp.0.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn original() {}\n").unwrap();
+        let store = temp.0.join("graft.db");
+        let target = repo::Target {
+            label: "repo".to_string(),
+            root,
+        };
+        (temp, store, target)
+    }
+
     #[test]
     fn tool_list_has_unique_names_and_object_schemas() {
         let tools = tool_schemas();
@@ -259,5 +327,77 @@ mod tests {
                 .iter()
                 .all(|tool| tool["inputSchema"]["type"] == "object")
         );
+    }
+
+    #[test]
+    fn freshness_is_observational_but_other_tools_build_and_refresh() {
+        let (_temp, store, target) = fixture("lazy-index");
+        let targets = [target.clone()];
+
+        let first = call_tool(&store, &targets, "freshness", &json!({}), false).unwrap();
+        assert_eq!(first["repo"]["indexed"], false);
+
+        let status = call_tool(&store, &targets, "status", &json!({}), false).unwrap();
+        assert_eq!(status["repo"]["freshness"]["indexed"], true);
+        assert!(
+            status["repo"]["freshness"]["added"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        std::fs::write(
+            target.root.join("lib.rs"),
+            "pub fn original() {}\npub fn added() {}\n",
+        )
+        .unwrap();
+        let stale = call_tool(&store, &targets, "freshness", &json!({}), false).unwrap();
+        assert_eq!(stale["repo"]["modified"], json!(["lib.rs"]));
+
+        let refreshed = call_tool(&store, &targets, "status", &json!({}), false).unwrap();
+        assert!(
+            refreshed["repo"]["freshness"]["modified"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let conn = db::open(&store).unwrap();
+        let repo_id = index::repo_id_of(&conn, &target.root).unwrap().unwrap();
+        let matches = index::grep(&conn, repo_id, &target.root, "added").unwrap();
+        assert!(!matches.groups.is_empty());
+    }
+
+    #[test]
+    fn no_refresh_does_not_create_a_missing_index() {
+        let (_temp, store, target) = fixture("no-refresh");
+        let error = call_tool(
+            &store,
+            std::slice::from_ref(&target),
+            "status",
+            &json!({}),
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("automatic indexing is disabled"));
+        let conn = db::open(&store).unwrap();
+        assert!(!index::freshness(&conn, &target.root).unwrap().indexed);
+    }
+
+    #[test]
+    fn invalid_tool_call_does_not_create_an_index() {
+        let (_temp, store, target) = fixture("invalid-call");
+        let error = call_tool(
+            &store,
+            std::slice::from_ref(&target),
+            "unknown",
+            &json!({}),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(error, "unknown tool: unknown");
+        let conn = db::open(&store).unwrap();
+        assert!(!index::freshness(&conn, &target.root).unwrap().indexed);
     }
 }

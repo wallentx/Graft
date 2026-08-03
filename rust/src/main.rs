@@ -2,8 +2,8 @@
 //!
 //! Nothing is written into an indexed repository. The graph lives in one SQLite
 //! store outside every work tree; a repo is identified by the realpath of its git
-//! toplevel. A directory graft has never indexed is reported as such rather than
-//! answered from an empty graph.
+//! toplevel. MCP lazily creates missing indexes; direct CLI reads report a
+//! directory that has never been indexed rather than answering from an empty graph.
 
 mod ask;
 mod db;
@@ -31,7 +31,7 @@ struct Cli {
     /// Store to use. Defaults to $XDG_DATA_HOME/graft/graft.db.
     #[arg(long, global = true)]
     store: Option<PathBuf>,
-    /// Answer from the current store without checking/rebuilding changed source.
+    /// Disable automatic indexing and refresh; answer only from an existing snapshot.
     #[arg(long, global = true)]
     no_refresh: bool,
     #[command(subcommand)]
@@ -126,6 +126,9 @@ enum Cmd {
             value_parser = ["claude", "codex", "cursor", "gemini", "antigravity", "opencode", "copilot"]
         )]
         providers: Vec<String>,
+        /// Remove explicitly named registrations instead of adding them.
+        #[arg(long, requires = "providers")]
+        deregister: bool,
         /// Print every target without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -188,6 +191,12 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum CacheCmd {
+    /// Remove every indexed repository and reclaim the database space.
+    Clear {
+        /// Confirm this destructive operation.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Remove records for repository paths that no longer exist.
     Prune,
     /// Run SQLite's full integrity check.
@@ -201,9 +210,7 @@ enum CacheCmd {
     },
 }
 
-/// The one message a caller sees for an unindexed directory. Every read path
-/// routes through here so the instruction is identical wherever it surfaces —
-/// including, later, the MCP server.
+/// The one message a direct CLI caller sees for an unindexed directory.
 fn not_indexed(root: &std::path::Path) -> String {
     format!(
         "{} has not been indexed by graft — run `graft build` to index it",
@@ -795,31 +802,36 @@ fn main() -> Result<()> {
             }
         }
 
-        Cmd::Mcp { path } => mcp::serve(&store, &path)?,
+        Cmd::Mcp { path } => mcp::serve(&store, &path, refresh_disabled(no_refresh))?,
 
         Cmd::Init {
             mut providers,
+            deregister,
             dry_run,
             json,
         } => {
-            if providers.is_empty() {
+            let interactive = providers.is_empty();
+            if interactive {
                 providers = init::select_providers()?;
             }
-            let writes = init::run(&providers, dry_run)?;
+            let writes = if interactive {
+                init::reconcile(&providers, dry_run)?
+            } else if deregister {
+                init::deregister(&providers, dry_run)?
+            } else {
+                init::register(&providers, dry_run)?
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&writes)?);
             } else {
-                println!("graft init{}", if dry_run { " --dry-run" } else { "" });
                 if writes.is_empty() {
-                    println!("  no providers selected");
+                    println!("no files written");
                 }
                 for write in writes {
                     println!(
-                        "  {} {} ({}, {})",
+                        "{} {}",
                         if dry_run { "would write" } else { "wrote" },
-                        write.path,
-                        write.provider,
-                        write.format
+                        write.path
                     );
                 }
             }
@@ -934,6 +946,16 @@ fn main() -> Result<()> {
             }
             let conn = db::open(&store)?;
             match command {
+                CacheCmd::Clear { yes } => {
+                    if !yes {
+                        anyhow::bail!("refusing to clear the whole store; rerun with --yes");
+                    }
+                    let removed = db::clear(&conn)?;
+                    println!(
+                        "cleared indexed repositories: {removed} ({})",
+                        store.display()
+                    );
+                }
                 CacheCmd::Prune => {
                     let removed = db::prune_missing(&conn)?;
                     println!("pruned {} missing repositorie(s)", removed.len());
