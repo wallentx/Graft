@@ -1,4 +1,4 @@
-//! Bounded newline-delimited JSON-RPC server for MCP hosts.
+//! Bounded newline-delimited JSON-RPC server for MCP clients.
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};

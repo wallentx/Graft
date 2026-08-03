@@ -1,47 +1,160 @@
-//! User-level host registration. Machine-specific executable paths belong only
-//! in user configuration, never in repository files.
+//! User-level provider registration. Machine-specific executable paths belong
+//! only in user configuration, never in repository files.
 
 use anyhow::{Context, Result, bail};
+use dialoguer::{MultiSelect, console::Term, theme::SimpleTheme};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::io::Write;
+use std::collections::HashSet;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+
+struct Provider {
+    id: &'static str,
+    name: &'static str,
+    config: &'static str,
+    detection: &'static str,
+    format: &'static str,
+    top_key: &'static str,
+}
+
+const PROVIDERS: &[Provider] = &[
+    Provider {
+        id: "claude",
+        name: "Claude Code",
+        config: ".claude.json",
+        detection: ".claude",
+        format: "json",
+        top_key: "mcpServers",
+    },
+    Provider {
+        id: "codex",
+        name: "Codex",
+        config: ".codex/config.toml",
+        detection: ".codex",
+        format: "toml",
+        top_key: "",
+    },
+    Provider {
+        id: "cursor",
+        name: "Cursor",
+        config: ".cursor/mcp.json",
+        detection: ".cursor",
+        format: "json",
+        top_key: "mcpServers",
+    },
+    Provider {
+        id: "gemini",
+        name: "Gemini CLI",
+        config: ".gemini/settings.json",
+        detection: ".gemini/settings.json",
+        format: "json",
+        top_key: "mcpServers",
+    },
+    Provider {
+        id: "antigravity",
+        name: "Antigravity",
+        config: ".gemini/config/mcp_config.json",
+        detection: ".gemini/config",
+        format: "json",
+        top_key: "mcpServers",
+    },
+    Provider {
+        id: "opencode",
+        name: "OpenCode",
+        config: ".config/opencode/opencode.json",
+        detection: ".config/opencode",
+        format: "opencode-json",
+        top_key: "mcp",
+    },
+    Provider {
+        id: "copilot",
+        name: "GitHub Copilot CLI",
+        config: ".copilot/mcp-config.json",
+        detection: ".copilot",
+        format: "json",
+        top_key: "mcpServers",
+    },
+];
 
 #[derive(Debug, Serialize)]
 pub struct PlannedWrite {
-    pub host: String,
+    pub provider: String,
     pub path: String,
     pub format: &'static str,
     pub action: &'static str,
 }
 
-pub fn run(hosts: &[String], dry_run: bool) -> Result<Vec<PlannedWrite>> {
+/// Show the interactive checkbox picker used by plain `graft init`.
+pub fn select_providers() -> Result<Vec<String>> {
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    let home = PathBuf::from(home);
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        bail!(
+            "graft init needs a terminal for provider selection; pass one or more --provider <id> values in scripts"
+        );
+    }
+
+    let items: Vec<String> = PROVIDERS
+        .iter()
+        .map(|provider| {
+            let detected = home.join(provider.detection).exists();
+            format!(
+                "{:<20}  ~/{:<34}{}",
+                provider.name,
+                provider.config,
+                if detected { " detected" } else { "" }
+            )
+        })
+        .collect();
+    let defaults: Vec<bool> = PROVIDERS
+        .iter()
+        .map(|provider| home.join(provider.detection).exists())
+        .collect();
+    let selections = MultiSelect::with_theme(&SimpleTheme)
+        .with_prompt("Select providers (space toggles, enter confirms)")
+        .items(&items)
+        .defaults(&defaults)
+        .interact_on(&Term::stderr())
+        .context("provider selection failed")?;
+    Ok(selections
+        .into_iter()
+        .map(|index| PROVIDERS[index].id.to_string())
+        .collect())
+}
+
+pub fn run(providers: &[String], dry_run: bool) -> Result<Vec<PlannedWrite>> {
     let home = std::env::var_os("HOME").context("HOME is not set")?;
     let home = PathBuf::from(home);
     let executable = std::env::current_exe()?.canonicalize()?;
     let mut writes = Vec::new();
-    for host in hosts {
-        let (path, format, top_key) = target(&home, host)?;
+    let mut seen = HashSet::new();
+    for id in providers {
+        if !seen.insert(id.as_str()) {
+            continue;
+        }
+        let provider = provider(id)?;
+        let path = home.join(provider.config);
         let action = if path.exists() { "update" } else { "create" };
         writes.push(PlannedWrite {
-            host: host.clone(),
+            provider: provider.id.to_string(),
             path: path.to_string_lossy().into_owned(),
-            format,
+            format: provider.format,
             action,
         });
         if dry_run {
             continue;
         }
-        match format {
+        match provider.format {
             "toml" => upsert_codex(&path, &executable)?,
             "opencode-json" => merge_json(
                 &path,
-                top_key,
+                provider.top_key,
                 json!({"type":"local", "command":[executable, "mcp"], "enabled":true}),
             )?,
             "json" => merge_json(
                 &path,
-                top_key,
+                provider.top_key,
                 json!({"command":executable, "args":["mcp"]}),
             )?,
             _ => unreachable!(),
@@ -50,28 +163,20 @@ pub fn run(hosts: &[String], dry_run: bool) -> Result<Vec<PlannedWrite>> {
     Ok(writes)
 }
 
-fn target(home: &Path, host: &str) -> Result<(PathBuf, &'static str, &'static str)> {
-    let target = match host {
-        "claude" => (home.join(".claude.json"), "json", "mcpServers"),
-        "codex" => (home.join(".codex/config.toml"), "toml", ""),
-        "cursor" => (home.join(".cursor/mcp.json"), "json", "mcpServers"),
-        "gemini" => (home.join(".gemini/settings.json"), "json", "mcpServers"),
-        "antigravity" => (
-            home.join(".gemini/config/mcp_config.json"),
-            "json",
-            "mcpServers",
-        ),
-        "opencode" => (
-            home.join(".config/opencode/opencode.json"),
-            "opencode-json",
-            "mcp",
-        ),
-        "copilot" => (home.join(".copilot/mcp-config.json"), "json", "mcpServers"),
-        _ => bail!(
-            "unsupported host {host:?}; expected claude, codex, cursor, gemini, antigravity, opencode, or copilot"
-        ),
-    };
-    Ok(target)
+fn provider(id: &str) -> Result<&'static Provider> {
+    PROVIDERS
+        .iter()
+        .find(|provider| provider.id == id)
+        .with_context(|| {
+            format!(
+                "unsupported provider {id:?}; expected {}",
+                PROVIDERS
+                    .iter()
+                    .map(|provider| provider.id)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
 }
 
 fn merge_json(path: &Path, top_key: &str, entry: Value) -> Result<()> {
@@ -171,20 +276,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_supported_hosts_use_user_level_paths() {
+    fn all_supported_providers_use_user_level_paths() {
         let home = Path::new("/home/tester");
-        for host in [
-            "claude",
-            "codex",
-            "cursor",
-            "gemini",
-            "antigravity",
-            "opencode",
-            "copilot",
-        ] {
-            let (path, _, _) = target(home, host).unwrap();
+        for provider in PROVIDERS {
+            let path = home.join(provider.config);
             assert!(path.starts_with(home));
         }
+    }
+
+    #[test]
+    fn duplicate_provider_ids_are_applied_once() {
+        let providers = ["codex".to_string(), "codex".to_string()];
+        let writes = run(&providers, true).unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].provider, "codex");
     }
 
     #[test]

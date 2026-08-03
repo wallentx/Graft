@@ -1,0 +1,5 @@
+phase	workload	total_syscalls	syscall_seconds	wait4_calls	wait4_seconds	execve_calls
+before	warm-build	6791	0.978574	2	0.462377	3
+after	warm-build	4357	0.211639	0	0	1
+before	ask	5103	0.864229	1	0.310069	2
+after	ask	3888	0.251349	0	0	1

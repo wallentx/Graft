@@ -28,22 +28,23 @@ Native Rust rewrite status after local cutover work on `wallentx/rust`.
 - [x] Bounded newline-delimited MCP JSON-RPC with initialize, ping, tool schemas,
   structured errors, stale/unindexed refusal, and 1 MiB request/response limits.
 - [x] MCP tools for find, grep, callers, skeleton, map, status, and freshness.
-- [x] User-level `init --dry-run` and registration for Claude, Codex, Cursor,
-  Gemini, Antigravity, opencode, and Copilot using the installed binary's
-  absolute path. Existing JSON is merged; invalid JSON is never overwritten;
-  writes are private and atomic.
+- [x] Interactive checkbox provider selection plus repeatable `--provider`,
+  `init --dry-run`, and registration for Claude Code, Codex, Cursor, Gemini CLI,
+  Antigravity, OpenCode, and Copilot CLI using the installed binary's absolute
+  path. Existing JSON is merged; invalid JSON is never overwritten; writes are
+  private and atomic.
 - [x] Self-contained loopback-only-by-default Rust HTML viewer and explicit HTML
   export.
 - [x] Deterministic Markdown-card/`INDEX.md` and JSON exports to explicit paths.
 - [x] Detailed `version`, non-self-modifying `upgrade`, Bash/Zsh/Fish/Elvish/
   PowerShell completion generation, SIGPIPE handling, and deterministic
   non-color output.
-- [x] Safe source install docs using the explicit
-  `https://github.com/wallentx/Graft.git` repository and `dev` branch. No npm or
-  `npx` installation path.
+- [x] Safe source install docs and an inspect-first local installer using the
+  explicit `https://github.com/wallentx/Graft.git` repository and `dev` branch.
+  No npm, `npx`, `sudo`, or remote-script execution path.
 - [x] npm CLI mapping and the complete legacy TypeScript/npm package removed.
-- [x] Tracked Node-era `.claude` hooks, shims, statusline, skill, and host config
-  removed; local host directories ignored.
+- [x] Tracked Node-era `.claude` hooks, shims, statusline, skill, and provider
+  config removed; local provider directories ignored.
 - [x] Stripped archive + SHA-256 packaging script and tag/manual release workflow.
 - [x] Ubuntu isolated-prefix release smoke covering every command help path,
   indexing/querying/export/viewer/MCP/init dry-run/SIGPIPE.
@@ -53,7 +54,7 @@ Native Rust rewrite status after local cutover work on `wallentx/rust`.
   ranked retrieval and call traversal; the obsolete harness was then removed.
 - [x] Native Termux release built and validated locally: AArch64 Android ELF,
   `/system/bin/linker64`, Android API 24, stripped; archive checksum verified.
-- [x] Native local suite: 48 Rust tests, rustfmt, clippy `-D warnings`, actionlint,
+- [x] Native local suite: 52 Rust tests, rustfmt, clippy `-D warnings`, actionlint,
   shellcheck, release smoke, and MCP smoke. Pre-cutover differential smoke also
   passed before removal of the legacy implementation.
 - [x] Removed obsolete TypeScript sources/tests/viewer, npm metadata, Node-only
@@ -91,31 +92,41 @@ Native Rust rewrite status after local cutover work on `wallentx/rust`.
 Performance was not the primary cutover target. The native implementation
 already avoids several obvious costs: unchanged files reuse cached extraction,
 SQLite uses WAL and FTS, indexed bodies are bounded, and release builds use thin
-LTO with stripped symbols. No benchmark suite exists yet, so do not claim the
-Rust CLI is faster than the TypeScript CLI without measurements.
+LTO with stripped symbols. The benchmark suite and device-scoped results live in
+`scripts/benchmark.sh` and `bench/RESULTS.md`; do not generalize those results to
+other repositories or systems without rerunning the harness.
 
-- [ ] Add reproducible benchmarks for cold builds, warm no-change builds,
+- [x] Added reproducible benchmarks for cold builds, warm no-change builds,
   one-file rebuilds, common queries, MCP calls, and large multi-repository
-  workspaces. Record wall time, peak memory, and database size on both Termux and
-  a conventional Linux host.
-- [ ] Profile representative workloads before changing hot paths; retain
-  before/after profiles with benchmark results.
-- [ ] Evaluate bounded parallel file parsing while preserving deterministic
-  database contents, output ordering, and useful behavior on memory-constrained
-  phones.
+  workspaces. Runs record wall time, peak memory, database size, toolchain/device
+  metadata, SQLite query plans, and per-workload medians.
+- [x] Profiled representative Termux workloads before optimization and retained
+  compact before/after measurements and syscall-profile summaries under
+  `bench/results/`.
+- [x] Removed Git subprocesses from normal repository/worktree discovery, reused
+  per-language Tree-sitter parser/query state, qualified in-degree subqueries so
+  existing composite indexes are used, reused the edge insert statement, and
+  skipped unchanged file metadata writes.
+- [x] Added bounded parallel file parsing for change sets above 64 files, with a
+  four-worker automatic ceiling, `--jobs`/`GRAFT_JOBS` overrides, per-worker
+  parser state, ordered database insertion, and serial/parallel graph-equivalence
+  coverage. On the measured Termux device, four workers reduced the 4,000-file
+  cold-build median from 2,555 ms to 2,422 ms (5.2%) while increasing peak RSS
+  from 30,424 KiB to 31,080 KiB (2.2%); smaller change sets remain serial.
 - [ ] Replace repository-wide edge re-resolution after a changed file with a
   proven affected-edge update algorithm.
-- [ ] Benchmark larger SQLite write batches, longer-lived prepared statements,
-  query plans, and additional indexes. Keep transaction rollback and concurrent
-  reader guarantees intact.
+- [x] Benchmarked prepared-statement reuse and existing SQLite query plans while
+  preserving transaction rollback and concurrent reader guarantees. Further
+  batching or indexes require a new profile demonstrating need.
 - [ ] Reduce extractor and ranking allocations, string cloning, and repeated
   tokenization where profiling shows meaningful cost.
 - [ ] Evaluate paginated or chunked handling for large exports and MCP tool
   results while preserving the 1 MiB JSON-RPC frame limit.
 - [ ] Evaluate a Git-assisted freshness fast path with a content-hash fallback
   for untracked, ignored, non-Git, and timestamp-ambiguous files.
-- [ ] Publish performance claims only with repeatable benchmark commands,
-  fixture sizes, hardware/runtime details, and measured before/after results.
+- [x] Published only scoped claims with repeatable benchmark commands, fixture
+  sizes, hardware/runtime details, medians, and measured before/after results.
+- [ ] Run and retain the same benchmark matrix on a conventional Linux system.
 
 ## Remaining release operations
 

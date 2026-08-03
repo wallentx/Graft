@@ -8,7 +8,6 @@
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 #[derive(Debug, Clone)]
 pub struct Target {
@@ -17,7 +16,7 @@ pub struct Target {
 }
 
 /// Languages the extractor understands, chosen by file extension.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Lang {
     TypeScript,
     Tsx,
@@ -56,19 +55,37 @@ pub fn root_of(start: &Path) -> Result<PathBuf> {
     std::fs::canonicalize(start).with_context(|| format!("canonicalize {}", start.display()))
 }
 
-fn git_toplevel(start: &Path) -> Option<PathBuf> {
-    let out = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(start)
-        .output()
-        .ok()?;
-    if !out.status.success() {
+fn git_dir(root: &Path) -> Option<PathBuf> {
+    let marker = root.join(".git");
+    if marker.is_dir() {
+        return std::fs::canonicalize(marker).ok();
+    }
+    if !marker.is_file() {
         return None;
     }
-    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!path.is_empty())
-        .then(|| std::fs::canonicalize(path).ok())
-        .flatten()
+    let text = std::fs::read_to_string(marker).ok()?;
+    let path = PathBuf::from(text.trim().strip_prefix("gitdir:")?.trim());
+    let path = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    std::fs::canonicalize(path).ok()
+}
+
+fn git_toplevel(start: &Path) -> Option<PathBuf> {
+    let mut current = std::fs::canonicalize(start).ok()?;
+    if current.is_file() {
+        current.pop();
+    }
+    loop {
+        if git_dir(&current).is_some() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
 }
 
 /// A git repository, or an immediate workspace containing at least two repos.
@@ -118,24 +135,20 @@ pub fn targets(start: &Path) -> Result<Vec<Target>> {
 /// `git rev-parse --git-common-dir`, which is shared by every worktree of a repo.
 /// Stored so a future change can decide whether worktrees share one graph.
 pub fn git_common_dir(root: &Path) -> Option<String> {
-    let o = Command::new("git")
-        .args(["rev-parse", "--git-common-dir"])
-        .current_dir(root)
-        .output()
-        .ok()?;
-    if !o.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-    if s.is_empty() {
-        return None;
-    }
-    // Relative for the main worktree (".git"), absolute for linked ones.
-    Some(
-        std::fs::canonicalize(root.join(&s))
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or(s),
-    )
+    let git_dir = git_dir(root)?;
+    let common = std::fs::read_to_string(git_dir.join("commondir"))
+        .ok()
+        .and_then(|text| {
+            let path = PathBuf::from(text.trim());
+            let path = if path.is_absolute() {
+                path
+            } else {
+                git_dir.join(path)
+            };
+            std::fs::canonicalize(path).ok()
+        })
+        .unwrap_or(git_dir);
+    Some(common.to_string_lossy().into_owned())
 }
 
 pub struct SourceFile {
@@ -219,6 +232,7 @@ pub fn walk(root: &Path) -> Result<Vec<SourceFile>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn lang_of_path_skips_declaration_files() {
@@ -289,5 +303,40 @@ mod tests {
             ["alpha", "beta"]
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn native_git_discovery_finds_a_parent_without_spawning_git() {
+        let root = std::env::temp_dir().join(format!("graft-git-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src/nested")).unwrap();
+
+        assert_eq!(root_of(&root.join("src/nested")).unwrap(), root);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn native_git_discovery_resolves_linked_worktree_common_dir() {
+        let base = std::env::temp_dir().join(format!("graft-worktree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let common = base.join("common");
+        let git_dir = common.join("worktrees/linked");
+        let worktree = base.join("linked");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+
+        assert_eq!(root_of(&worktree.join("src")).unwrap(), worktree);
+        assert_eq!(
+            git_common_dir(&worktree).unwrap(),
+            std::fs::canonicalize(&common).unwrap().to_string_lossy()
+        );
+        let _ = std::fs::remove_dir_all(base);
     }
 }

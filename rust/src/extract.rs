@@ -257,6 +257,68 @@ fn language(lang: Lang) -> tree_sitter::Language {
     }
 }
 
+struct CompiledExtractor {
+    parser: Parser,
+    defs: Query,
+    calls: Query,
+    bindings: Query,
+    imports: Query,
+    python_aliases: Option<Query>,
+}
+
+impl CompiledExtractor {
+    fn new(lang: Lang) -> Result<Self> {
+        let language = language(lang);
+        let mut parser = Parser::new();
+        parser.set_language(&language).context("set_language")?;
+        let queries = queries(lang);
+        Ok(Self {
+            parser,
+            defs: Query::new(&language, queries.defs).context("compile definition query")?,
+            calls: Query::new(&language, queries.calls).context("compile call query")?,
+            bindings: Query::new(&language, queries.bindings).context("compile binding query")?,
+            imports: Query::new(&language, queries.imports).context("compile import query")?,
+            python_aliases: (lang == Lang::Python)
+                .then(|| {
+                    Query::new(&language, PY_FIELD_ALIASES)
+                        .context("compile Python field-alias query")
+                })
+                .transpose()?,
+        })
+    }
+}
+
+/// Reusable parser and compiled-query state for one build.
+///
+/// Tree-sitter parsers and query compilation are much more expensive than
+/// clearing them for another file. Keeping one instance per language avoids
+/// paying that setup cost for every source file while preserving serial,
+/// deterministic extraction.
+pub struct Extractor {
+    compiled: HashMap<Lang, CompiledExtractor>,
+}
+
+impl Extractor {
+    pub fn new() -> Self {
+        Self {
+            compiled: HashMap::new(),
+        }
+    }
+
+    pub fn extract(&mut self, lang: Lang, src: &str) -> Result<Extracted> {
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.compiled.entry(lang) {
+            entry.insert(CompiledExtractor::new(lang)?);
+        }
+        extract_compiled(
+            self.compiled
+                .get_mut(&lang)
+                .context("compiled extractor missing after insertion")?,
+            lang,
+            src,
+        )
+    }
+}
+
 /// A node's kind, mapped to the vocabulary stored in `symbols.kind`.
 fn kind_of(n: &Node) -> &'static str {
     match n.kind() {
@@ -340,15 +402,19 @@ fn search_text_of(src: &str, node: &Node<'_>) -> String {
     text[..end].to_string()
 }
 
+#[cfg(test)]
 pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
-    let ts_lang = language(lang);
-    let mut parser = Parser::new();
-    parser.set_language(&ts_lang).context("set_language")?;
-    let tree = parser.parse(src, None).context("parse returned no tree")?;
+    Extractor::new().extract(lang, src)
+}
+
+fn extract_compiled(compiled: &mut CompiledExtractor, lang: Lang, src: &str) -> Result<Extracted> {
+    let tree = compiled
+        .parser
+        .parse(src, None)
+        .context("parse returned no tree")?;
     let root = tree.root_node();
 
-    let q = queries(lang);
-    let def_q = Query::new(&ts_lang, q.defs).context("compile definition query")?;
+    let def_q = &compiled.defs;
     let name_idx = def_q
         .capture_index_for_name("name")
         .context("query lacks @name")?;
@@ -368,7 +434,7 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
     let mut spans: Vec<(usize, usize)> = Vec::new();
 
     let mut cursor = QueryCursor::new();
-    let mut it = cursor.matches(&def_q, root, src.as_bytes());
+    let mut it = cursor.matches(def_q, root, src.as_bytes());
     while let Some(m) = it.next() {
         let name_node = m
             .captures
@@ -477,7 +543,7 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
         })
         .collect();
 
-    let call_q = Query::new(&ts_lang, q.calls).context("compile call query")?;
+    let call_q = &compiled.calls;
     let callee_idx = call_q
         .capture_index_for_name("callee")
         .context("query lacks @callee")?;
@@ -486,7 +552,7 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
         .context("query lacks @recv")?;
     let mut calls = Vec::new();
     let mut cursor = QueryCursor::new();
-    let mut it = cursor.matches(&call_q, root, src.as_bytes());
+    let mut it = cursor.matches(call_q, root, src.as_bytes());
     while let Some(m) = it.next() {
         // Per match, not per capture: a member call matches @recv and @callee
         // together, and iterating captures would record the call twice.
@@ -509,7 +575,7 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
         });
     }
 
-    let bind_q = Query::new(&ts_lang, q.bindings).context("compile binding query")?;
+    let bind_q = &compiled.bindings;
     let b_name = bind_q.capture_index_for_name("name");
     let b_field = bind_q.capture_index_for_name("field");
     let _ = &b_field;
@@ -527,7 +593,7 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
         }
     }
     let mut cursor = QueryCursor::new();
-    let mut it = cursor.matches(&bind_q, root, src.as_bytes());
+    let mut it = cursor.matches(bind_q, root, src.as_bytes());
     while let Some(m) = it.next() {
         let Some(ty_node) = m.captures.iter().find(|c| c.index == b_ty).map(|c| c.node) else {
             continue;
@@ -562,8 +628,10 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
     // Propagate an annotated parameter into a self field:
     // `def __init__(self, store: Store): self.store = store`.
     if lang == Lang::Python {
-        let alias_q =
-            Query::new(&ts_lang, PY_FIELD_ALIASES).context("compile Python field-alias query")?;
+        let alias_q = compiled
+            .python_aliases
+            .as_ref()
+            .context("Python extractor lacks field-alias query")?;
         let object_idx = alias_q
             .capture_index_for_name("object")
             .context("alias query lacks @object")?;
@@ -575,7 +643,7 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
             .context("alias query lacks @source")?;
         let mut aliases = Vec::new();
         let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(&alias_q, root, src.as_bytes());
+        let mut matches = cursor.matches(alias_q, root, src.as_bytes());
         while let Some(m) = matches.next() {
             let captured = |index| {
                 m.captures
@@ -613,10 +681,10 @@ pub fn extract(lang: Lang, src: &str) -> Result<Extracted> {
         }
     }
 
-    let imp_q = Query::new(&ts_lang, q.imports).context("compile import query")?;
+    let imp_q = &compiled.imports;
     let mut imports = Vec::new();
     let mut cursor = QueryCursor::new();
-    let mut it = cursor.matches(&imp_q, root, src.as_bytes());
+    let mut it = cursor.matches(imp_q, root, src.as_bytes());
     while let Some(m) = it.next() {
         for c in m.captures {
             // The capture is a string literal including its quotes.

@@ -1,39 +1,156 @@
 # Graft
 
-Native repository context graph for coding agents. Graft indexes source into one
-SQLite store outside the repository, refreshes changed files incrementally, and
-answers structural and ranked retrieval queries without Node, npm, `npx`, a
-daemon, telemetry, or model API calls.
+Graft builds a local structural map of a source repository for people and coding
+agents. It indexes definitions, imports, and resolvable calls into one SQLite
+database outside the repository, then exposes that graph through a CLI and MCP.
 
-## Install from `wallentx/Graft`, branch `dev`
+It is a native Rust executable. There is no Node.js runtime, npm, `npx`, daemon,
+telemetry, model API, or repository-local agent configuration.
 
-Termux:
+## What it does
+
+- Indexes TypeScript, TSX, JavaScript, Python, Go, and Rust.
+- Finds relevant symbols for natural-language questions.
+- Groups regex or literal matches under their enclosing symbol.
+- Traverses incoming and outgoing call/import relationships.
+- Produces file skeletons, repository maps, JSON, Markdown, and an HTML viewer.
+- Serves the same tools to Codex, Claude Code, Cursor, Gemini CLI, Antigravity,
+  OpenCode, and GitHub Copilot CLI through MCP.
+- Incrementally reparses changed files and automatically refreshes normal CLI
+  queries when source changes.
+
+Graft does not modify an indexed repository. Its shared database defaults to
+`$XDG_DATA_HOME/graft/graft.db`, falling back to
+`~/.local/share/graft/graft.db`.
+
+## Install
+
+The current native work is installed from the explicit
+[`wallentx/Graft`](https://github.com/wallentx/Graft) repository and `dev`
+branch.
+
+### Termux
+
+Install native build prerequisites, clone the repository so it can be inspected,
+and run the local installer:
 
 ```sh
+pkg update
 pkg install git rust clang
-cargo install --git https://github.com/wallentx/Graft.git --branch dev --locked graft
+git clone --branch dev --single-branch https://github.com/wallentx/Graft.git
+cd Graft
+./install.sh
 ```
 
-Other platforms with Rust installed:
+This builds a native Android/Bionic executable and installs it to
+`~/.local/bin/graft`. It does not require `proot`, Node.js, npm, or `npx`.
+
+If `~/.local/bin` is not already on `PATH`, add it to your shell configuration:
 
 ```sh
-cargo install --git https://github.com/wallentx/Graft.git --branch dev --locked graft
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-`dev` is mutable. Replace `--branch dev` with `--rev <full-commit-sha>` for a
-reproducible source install. Cargo builds locally for the current target, so the
-installed executable uses Termux's Android/Bionic ABI when run in Termux.
+### Linux and other Rust targets
 
-To install this checkout instead:
+Install Git, Rust, Cargo, and a C compiler with the operating system package
+manager, then use the same inspect-first flow:
 
 ```sh
-cargo install --path rust --locked --force
+git clone --branch dev --single-branch https://github.com/wallentx/Graft.git
+cd Graft
+./install.sh
 ```
 
-The binary normally lands in `~/.cargo/bin`. Add that directory to `PATH` if
-Cargo reports a successful install but `graft` is not found.
+Choose another user-owned installation root when needed:
 
-## Start
+```sh
+./install.sh --prefix "$HOME/.local/graft"
+```
+
+The installer never uses `sudo`. It builds only the checkout containing the
+script, verifies that the installed binary starts, and then prints the exact
+`PATH` entry and next steps.
+
+### Direct Cargo install
+
+If inspecting a clone first is not required:
+
+```sh
+cargo install \
+  --git https://github.com/wallentx/Graft.git \
+  --branch dev \
+  --locked \
+  --root "$HOME/.local" \
+  graft
+```
+
+The `dev` branch is mutable. For a reproducible source install, replace
+`--branch dev` with `--rev <full-commit-sha>`.
+
+### Update or uninstall
+
+The `upgrade` command explains the update policy but never downloads or executes
+anything. Update an inspect-first installation from its checkout:
+
+```sh
+cd Graft
+git pull --ff-only origin dev
+./install.sh
+```
+
+Remove an installation made under the default root:
+
+```sh
+cargo uninstall --root "$HOME/.local" graft
+```
+
+## Configure providers
+
+Run `init` with no options to open the interactive checkbox picker:
+
+```sh
+graft init
+```
+
+```text
+Select providers (space toggles, enter confirms)
+> [ ] Claude Code           ~/.claude.json
+  [x] Codex                 ~/.codex/config.toml             detected
+  [ ] Cursor                ~/.cursor/mcp.json
+```
+
+Detected providers start checked. Move with the arrow keys, toggle with space,
+and apply the selection with enter. Graft merges an MCP entry named `graft` into
+each selected user configuration. Existing unrelated entries are preserved,
+invalid JSON is refused, and writes are private and atomic.
+
+For scripts or headless machines, repeat `--provider` instead of opening the
+picker:
+
+```sh
+graft init --provider codex --provider claude
+graft init --provider cursor --dry-run
+graft init --provider opencode --dry-run --json
+```
+
+Supported provider IDs and destinations:
+
+| Provider ID | Provider | User configuration |
+|---|---|---|
+| `claude` | Claude Code | `~/.claude.json` |
+| `codex` | Codex | `~/.codex/config.toml` |
+| `cursor` | Cursor | `~/.cursor/mcp.json` |
+| `gemini` | Gemini CLI | `~/.gemini/settings.json` |
+| `antigravity` | Antigravity | `~/.gemini/config/mcp_config.json` |
+| `opencode` | OpenCode | `~/.config/opencode/opencode.json` |
+| `copilot` | GitHub Copilot CLI | `~/.copilot/mcp-config.json` |
+
+The registered command is the installed executable's absolute path. No
+machine-specific path, hook, prompt, or provider file is written into a source
+repository.
+
+## Quick start
 
 ```sh
 cd /path/to/repository
@@ -41,117 +158,118 @@ graft build
 graft map
 graft ask "where is request validation handled?" --source
 graft callers validate_request --depth 2
-graft grep 'TODO|FIXME'
+graft grep 'TODO|FIXME' --path .
 graft check
 ```
 
-Graft supports TypeScript, TSX, JavaScript (`.js`, `.jsx`, `.mjs`, `.cjs`),
-Python, Go, and Rust. It honors gitignore rules and skips TypeScript declaration
-files. Every read command checks live source hashes first and incrementally
-refreshes stale rows. Use `--no-refresh` or `GRAFT_NO_REFRESH=1` for a read-only
-snapshot.
+`build` walks the Git worktree using gitignore-compatible rules and skips
+TypeScript declaration files. Subsequent builds reuse unchanged extraction
+payloads. Large cold builds use at most four parser workers; use `--jobs 1` or
+`GRAFT_JOBS=1` on a memory-constrained device.
 
-The shared store defaults to `$XDG_DATA_HOME/graft/graft.db`, then
-`~/.local/share/graft/graft.db`. Indexed repositories are never modified.
+Normal CLI query commands refresh a stale index before answering. `check` and
+`status` are observational: they report drift without repairing it. MCP refuses
+stale or unindexed data rather than silently returning an incomplete graph. Use
+global `--no-refresh` or `GRAFT_NO_REFRESH=1` when an intentional stored snapshot
+is required.
 
 ## Commands
 
 | Command | Purpose |
 |---|---|
-| `build [path]` | Incrementally index one repository or every child in a multi-repo folder |
-| `ask <query> [path]` | Ranked lexical/structural retrieval with optional source excerpts |
-| `grep <regex>` | Exhaustive source search grouped by enclosing symbol |
-| `callers <symbol>` | Incoming or outgoing call/import traversal |
-| `skeleton <file>` | Definitions, signatures, and source spans in one file |
-| `map [path]` | Directory clusters, hubs, and hotspots |
-| `check [path]` | Non-mutating CI freshness check |
-| `status [path]` | Store counts, schema, age, extractor, and source drift |
-| `mcp [path]` | Bounded newline-delimited MCP JSON-RPC server |
-| `init --host <id>` | User-level MCP registration using this executable's absolute path |
-| `viz [path]` | Loopback HTML viewer, or `--output map.html` |
-| `export <destination>` | Deterministic Markdown cards or `--json` export |
-| `cache prune|doctor|recover|reset` | Store maintenance and recoverable repair |
-| `version` | Build, executable, schema, extractor, and store identity |
-| `upgrade` | Safe package-manager/source update guidance; never self-modifies |
-| `completions <shell>` | Generate Bash, Zsh, Fish, Elvish, or PowerShell completions |
+| `build [path]` | Incrementally index a repository or multi-repository workspace |
+| `ask <query> [path]` | Ranked lexical and structural symbol retrieval |
+| `grep <pattern> --path <path>` | Regex or literal source search grouped by symbol |
+| `callers <symbol>` | Traverse incoming or outgoing calls and imports |
+| `skeleton <file>` | List definitions, signatures, and spans in one file |
+| `map [path]` | Show directory clusters, hubs, and hotspots |
+| `viz [path]` | Serve a loopback viewer or write self-contained HTML |
+| `export <destination>` | Write deterministic Markdown cards or JSON |
+| `init` | Select and configure MCP providers |
+| `mcp [path]` | Serve newline-delimited MCP JSON-RPC over stdin/stdout |
+| `check [path]` | Fail when an index is missing, stale, or incompatible |
+| `status [path]` | Report graph counts, age, schema, extractor, and source drift |
+| `cache prune` | Remove records for repository paths that no longer exist |
+| `cache doctor` | Run SQLite's full integrity check |
+| `cache recover` | Preserve a damaged store and create a clean replacement |
+| `cache reset [path]` | Remove one repository graph from the shared store |
+| `version` | Show binary, build, schema, extractor, and store identity |
+| `upgrade` | Show the safe update path without modifying the executable |
+| `completions <shell>` | Generate shell completion code |
 
-Run `graft <command> --help` for flags. Read commands support stable JSON where
-applicable. Path scopes are segment-aware with `--in`; workspace results include
-`scope` labels. Ranked workspace results interleave child repositories so a large
-child cannot monopolize top-N.
+Run `graft <command> --help` for the complete flags. Read commands provide JSON
+where applicable. `ask`, `grep`, and `callers` accept segment-aware `--in`
+scopes.
 
-Exit codes:
+Exit status `0` means the command completed, including an empty search. Status
+`1` means a failed freshness/integrity check or another runtime error. Status `2`
+means bad input, an unindexed repository, or a missing/ambiguous requested node.
 
-| Code | Meaning |
-|---:|---|
-| `0` | Command completed; an empty search is valid output |
-| `1` | Stale/failed check or internal error |
-| `2` | Unindexed repository, missing/ambiguous requested node, or bad CLI input |
+## MCP tools
 
-## Agent/MCP setup
+The MCP server exposes:
 
-Preview user-level writes first:
+- `find`
+- `grep`
+- `callers`
+- `skeleton`
+- `map`
+- `status`
+- `freshness`
 
-```sh
-graft init --host codex --dry-run
-graft init --host claude --host cursor --dry-run --json
-```
+Requests and responses are capped at 1 MiB. Retrieval is local and
+deterministic; Graft does not send source code or queries to a model service.
 
-Apply selected registrations by omitting `--dry-run`. Supported IDs are
-`claude`, `codex`, `cursor`, `gemini`, `antigravity`, `opencode`, and `copilot`.
-Registration merges a `graft` MCP entry into the host's user configuration and
-uses the installed executable's absolute path. No machine-specific path is
-written into the indexed repository. No background edit hooks are installed.
+## Multi-repository workspaces
 
-The MCP server exposes `find`, `grep`, `callers`, `skeleton`, `map`, `status`,
-and `freshness`. It refuses stale or unindexed data instead of silently answering
-from an incomplete graph. Requests and responses are capped at 1 MiB.
+A non-repository directory containing at least two immediate Git repository
+children is treated as a workspace. Build and query commands federate those
+children and label results by repository. Ranked results are interleaved so one
+large child cannot consume the entire result limit.
 
-## Workspace behavior
-
-A non-repository directory with at least two immediate Git repository children
-is a workspace. `build`, `ask`, `grep`, `callers`, `skeleton`, `map`, `check`,
-and MCP federate those child graphs. Each worktree has its own repository row;
-`git_common_dir` is recorded for diagnosis but linked worktrees do not share
-source rows because their checked-out contents can differ.
+Linked Git worktrees keep separate graph rows because their checked-out source
+can differ. Their shared Git directory is recorded only for diagnostics.
 
 ## Viewer and exports
 
-`graft viz` now uses a self-contained Rust-rendered page. It binds only to
-loopback unless `--allow-remote` is explicit.
-
-`graft export out/` writes deterministic Markdown cards plus `INDEX.md`.
-`graft export graph.json --json` writes one JSON document. Existing destinations
-require `--force`.
-
-## Deliberate rewrite decisions
-
-- No `--deep` network/LLM enrichment in the native CLI. Search uses deterministic
-  symbol metadata, bounded definition bodies, IDF weighting, coupling boosts,
-  strength gating, and test-path de-ranking.
-- Call graph edges are `contains`, `imports`, and resolved `calls`. Unknown member
-  receiver types stay unresolved instead of falling back to same-name methods.
-  Inheritance/reference edges are not used for `callers` and are intentionally
-  outside the native blast-radius contract.
-- No self-updater. `graft upgrade` never downloads or executes code.
-- No repository-local agent hooks or host files. Freshness is checked on query;
-  host registration belongs under the user's host configuration.
-- Non-color deterministic output is the default. Unicode arrows appear only in
-  human display; JSON is ASCII-safe data.
-
-## Binary releases
-
-Release archives contain the stripped binary, README, and license. Each archive
-has a SHA-256 sidecar:
+`graft viz` starts a self-contained HTML viewer on loopback. Binding a non-loopback
+address requires explicit `--allow-remote`:
 
 ```sh
-./scripts/package-release.sh
-sha256sum -c release/graft-*.tar.gz.sha256
+graft viz
+graft viz --output map.html
 ```
 
-Do not execute downloaded installer scripts. Download an archive and checksum,
-verify the checksum, inspect the extracted files, then copy `graft` into a
-directory on `PATH`.
+Exports are deterministic and require an explicit destination. Existing output
+is not replaced without `--force`:
+
+```sh
+graft export docs/graft-map
+graft export graph.json --json
+```
+
+## Graph boundaries
+
+Graft records `contains`, `imports`, and calls it can resolve without guessing.
+Unknown receiver types stay unresolved instead of creating false same-name
+edges. Inheritance and arbitrary reference edges are not part of the native
+`callers` contract.
+
+Natural-language `ask` is deterministic local retrieval over symbol names,
+signatures, bounded definition bodies, graph coupling, and test-path de-ranking.
+There is no embedding service or `--deep` model enrichment.
+
+## Security and privacy
+
+- Indexed source and queries stay on the machine.
+- The index lives outside the repository.
+- Provider setup touches only explicitly selected user configuration files.
+- Invalid existing JSON is never overwritten.
+- There is no self-updater or remote installer execution.
+- Release archives contain a stripped binary, README, license, and SHA-256
+  sidecar; verify the checksum before copying a release binary onto `PATH`.
+
+See [SECURITY.md](SECURITY.md) for reporting and policy details.
 
 ## Development
 
@@ -159,16 +277,20 @@ directory on `PATH`.
 git clone --branch dev https://github.com/wallentx/Graft.git
 cd Graft
 cargo fmt --all --check
-cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo build --workspace --release --locked
 ```
 
-## Security
+The deterministic performance harness records wall time, peak RSS, database
+size, device/toolchain metadata, SQLite plans, and optional syscall profiles:
 
-See [SECURITY.md](SECURITY.md). Graft has no telemetry. Source indexing and all
-native queries stay local. `init` refuses invalid existing JSON instead of
-overwriting it; `cache recover` preserves the old database beside a clean store.
+```sh
+./scripts/benchmark.sh
+```
+
+See [bench/RESULTS.md](bench/RESULTS.md) for device-scoped measurements. Those
+results are not universal performance claims.
 
 ## License
 

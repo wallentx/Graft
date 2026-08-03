@@ -119,7 +119,8 @@ pub fn ask(
     let mut statement = db.prepare(
         "select s.id, s.name, s.kind, f.path, s.start_line, s.end_line,
                 coalesce(s.signature,''), coalesce(s.summary,''),
-                (select count(*) from edges e where e.dst_symbol_id=s.id)
+                (select count(*) from edges e
+                  where e.repo_id=s.repo_id and e.dst_symbol_id=s.id)
            from symbols s join files f on f.id=s.file_id
           where s.repo_id=?1 and s.kind != 'module'
           order by f.path, s.start_line, s.id",

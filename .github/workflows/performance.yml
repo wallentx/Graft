@@ -1,0 +1,58 @@
+name: Performance
+
+on:
+  workflow_dispatch:
+    inputs:
+      files:
+        description: Files in the single-repository fixture
+        required: true
+        default: '400'
+        type: string
+      build-runs:
+        description: Cold, warm, and one-file build repetitions
+        required: true
+        default: '3'
+        type: string
+      query-runs:
+        description: Query and MCP repetitions
+        required: true
+        default: '5'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install profiling tools
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 strace
+
+      - name: Build release binary
+        run: cargo build --workspace --release --locked
+
+      - name: Run benchmark matrix
+        env:
+          GRAFT_BENCH_FILES: ${{ inputs.files }}
+          GRAFT_BENCH_BUILD_RUNS: ${{ inputs.build-runs }}
+          GRAFT_BENCH_QUERY_RUNS: ${{ inputs.query-runs }}
+        run: scripts/benchmark.sh --output "$RUNNER_TEMP/graft-benchmark"
+
+      - name: Upload benchmark evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: graft-performance-linux-${{ github.run_id }}
+          path: ${{ runner.temp }}/graft-benchmark
+          if-no-files-found: error
+          retention-days: 30

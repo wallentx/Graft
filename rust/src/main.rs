@@ -44,6 +44,9 @@ enum Cmd {
     Build {
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Maximum extraction workers (default: min(available CPUs, 4)).
+        #[arg(long, value_parser = parse_jobs)]
+        jobs: Option<usize>,
     },
     /// Find the most relevant symbols for a natural-language question.
     Ask {
@@ -109,15 +112,20 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Serve Graft tools to MCP hosts over stdin/stdout JSON-RPC.
+    /// Serve Graft tools to MCP clients over stdin/stdout JSON-RPC.
     Mcp {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
-    /// Register the installed binary with user-level agent host configuration.
+    /// Register Graft with one or more coding-agent providers.
     Init {
-        #[arg(long = "host", required = true)]
-        hosts: Vec<String>,
+        /// Provider to configure; repeat for scripts. Omit to open the checkbox picker.
+        #[arg(
+            long = "provider",
+            value_name = "ID",
+            value_parser = ["claude", "codex", "cursor", "gemini", "antigravity", "opencode", "copilot"]
+        )]
+        providers: Vec<String>,
         /// Print every target without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -296,6 +304,16 @@ fn parse_depth(value: &str) -> Option<usize> {
     value.parse().ok().filter(|depth| *depth > 0)
 }
 
+fn parse_jobs(value: &str) -> std::result::Result<usize, String> {
+    let jobs = value
+        .parse::<usize>()
+        .map_err(|_| "jobs must be an integer from 1 through 32".to_string())?;
+    (1..=32)
+        .contains(&jobs)
+        .then_some(jobs)
+        .ok_or_else(|| "jobs must be an integer from 1 through 32".to_string())
+}
+
 fn main() -> Result<()> {
     // Rust ignores SIGPIPE, so `graft grep x | head` panics on the first write
     // past the closed pipe instead of exiting quietly the way every other CLI
@@ -313,11 +331,15 @@ fn main() -> Result<()> {
     };
 
     match cli.cmd {
-        Cmd::Build { path } => {
+        Cmd::Build { path, jobs } => {
             let mut conn = db::open(&store)?;
             for target in repo::targets(&path)? {
                 let t0 = std::time::Instant::now();
-                let s = index::build(&mut conn, &target.root)?;
+                let s = index::build_with_jobs(
+                    &mut conn,
+                    &target.root,
+                    jobs.unwrap_or_else(index::default_jobs),
+                )?;
                 println!(
                     "[{}] indexed {} — {} files, {} symbols, {} edges ({} unresolved; {} parsed, {} reused, {} deleted) in {:.2}s",
                     target.label,
@@ -776,21 +798,27 @@ fn main() -> Result<()> {
         Cmd::Mcp { path } => mcp::serve(&store, &path)?,
 
         Cmd::Init {
-            hosts,
+            mut providers,
             dry_run,
             json,
         } => {
-            let writes = init::run(&hosts, dry_run)?;
+            if providers.is_empty() {
+                providers = init::select_providers()?;
+            }
+            let writes = init::run(&providers, dry_run)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&writes)?);
             } else {
                 println!("graft init{}", if dry_run { " --dry-run" } else { "" });
+                if writes.is_empty() {
+                    println!("  no providers selected");
+                }
                 for write in writes {
                     println!(
                         "  {} {} ({}, {})",
                         if dry_run { "would write" } else { "wrote" },
                         write.path,
-                        write.host,
+                        write.provider,
                         write.format
                     );
                 }
@@ -964,8 +992,11 @@ fn main() -> Result<()> {
 
         Cmd::Upgrade => {
             println!("graft does not download or execute updates itself.");
-            println!("Update through the same package or release installer used for this binary.");
-            println!("Source install: git pull, then cargo install --path rust --locked --force");
+            println!("Update through the same package or source method used for this binary.");
+            println!("Inspect-first checkout: git pull --ff-only, then ./install.sh");
+            println!(
+                "Direct Cargo install: cargo install --git https://github.com/wallentx/Graft.git --branch dev --locked --root \"$HOME/.local\" graft"
+            );
         }
 
         Cmd::Viz {

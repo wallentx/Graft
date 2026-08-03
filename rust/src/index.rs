@@ -1,6 +1,6 @@
 //! `build` and `grep`: the write and read ends of the store.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -109,16 +109,12 @@ pub fn freshness(db: &Connection, root: &Path) -> Result<Freshness> {
     })
 }
 
-/// Index `root` into `db`, replacing whatever was there for that repo.
-///
-/// Whole-repo replace rather than per-file diffing: correctness first. The
-/// `files.hash` column is populated so an incremental path can be added without a
-/// schema change, but nothing reads it yet — a partially-correct incremental
-/// build is worse than a slower complete one.
 #[derive(Debug)]
 struct ExistingFile {
     id: i64,
     hash: String,
+    mtime: i64,
+    size: i64,
 }
 
 struct Pending {
@@ -137,6 +133,34 @@ struct Pending {
 /// rebuilt from all cached/current extraction payloads because a definition
 /// change in one file can change resolution for callers in every other file.
 pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
+    build_with_jobs(db, root, default_jobs())
+}
+
+/// Number of extraction workers used when a caller does not choose explicitly.
+///
+/// Four workers are enough to expose parser parallelism without letting a large
+/// repository multiply its peak memory usage by every CPU visible to Android or
+/// a shared CI runner. `GRAFT_JOBS` is useful for repeatable benchmarks and for
+/// low-memory devices; command-line builds expose the same value as `--jobs`.
+pub fn default_jobs() -> usize {
+    std::env::var("GRAFT_JOBS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|jobs| *jobs > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1)
+                .min(4)
+        })
+        .clamp(1, 32)
+}
+
+pub fn build_with_jobs(
+    db: &mut Connection,
+    root: &Path,
+    requested_jobs: usize,
+) -> Result<BuildStats> {
     let files = repo::walk(root).context("walk the work tree")?;
     let common = repo::git_common_dir(root);
     let now = unix_now();
@@ -179,10 +203,10 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
         }
     }
 
-    let mut pending = Vec::with_capacity(files.len());
-    let mut parsed = 0usize;
+    let mut pending: Vec<Option<Pending>> = (0..files.len()).map(|_| None).collect();
+    let mut changed = Vec::new();
     let mut reused = 0usize;
-    for file in &files {
+    for (index, file) in files.iter().enumerate() {
         let cached = existing
             .get(&file.rel)
             .filter(|old| old.hash == file.hash)
@@ -190,11 +214,16 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
             .transpose()?;
 
         if let Some(cached) = cached {
-            tx.execute(
-                "update files set mtime=?1, size=?2 where id=?3",
-                rusqlite::params![file.mtime, file.size, cached.file_id],
-            )?;
-            pending.push(cached);
+            let old = existing
+                .get(&file.rel)
+                .context("cached file missing from existing rows")?;
+            if old.mtime != file.mtime || old.size != file.size {
+                tx.execute(
+                    "update files set mtime=?1, size=?2 where id=?3",
+                    rusqlite::params![file.mtime, file.size, cached.file_id],
+                )?;
+            }
+            pending[index] = Some(cached);
             reused += 1;
             continue;
         }
@@ -202,9 +231,21 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
         if let Some(old) = existing.get(&file.rel) {
             tx.execute("delete from files where id=?1", [old.id])?;
         }
-        pending.push(index_file(&tx, repo_id, file)?);
-        parsed += 1;
+        changed.push(index);
     }
+
+    // Parsing is CPU-bound and owns no database state. Each bounded worker gets
+    // its own Tree-sitter parsers/queries; rows are still inserted serially in
+    // sorted file order so IDs and exported graph output remain deterministic.
+    let parsed_files = extract_changed(&files, &changed, requested_jobs)?;
+    for (index, extracted) in parsed_files {
+        pending[index] = Some(index_extracted(&tx, repo_id, &files[index], extracted)?);
+    }
+    let pending: Vec<Pending> = pending
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .context("missing extraction after parallel parse")?;
+    let parsed = changed.len();
 
     let mut by_name: HashMap<String, Vec<i64>> = HashMap::new();
     let mut by_container: HashMap<(String, String), Vec<i64>> = HashMap::new();
@@ -230,6 +271,10 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
     }
 
     let mut n_edges = 0usize;
+    let mut insert_edge = tx.prepare(
+        "insert or ignore into edges(repo_id, src_symbol_id, dst_symbol_id, kind)
+         values (?1, ?2, ?3, ?4)",
+    )?;
     for file in &pending {
         for (index, &id) in file.symbol_ids.iter().enumerate() {
             let parent = file
@@ -240,11 +285,7 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
                 .flatten()
                 .and_then(|parent| file.symbol_ids.get(parent).copied())
                 .unwrap_or(file.file_symbol);
-            n_edges += tx.execute(
-                "insert or ignore into edges(repo_id, src_symbol_id, dst_symbol_id, kind)
-                 values (?1, ?2, ?3, 'contains')",
-                rusqlite::params![repo_id, parent, id],
-            )?;
+            n_edges += insert_edge.execute(rusqlite::params![repo_id, parent, id, "contains"])?;
         }
     }
 
@@ -279,11 +320,12 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
                 targets.push(target);
             }
             for target in targets {
-                n_edges += tx.execute(
-                    "insert or ignore into edges(repo_id, src_symbol_id, dst_symbol_id, kind)
-                     values (?1, ?2, ?3, 'imports')",
-                    rusqlite::params![repo_id, file.file_symbol, target],
-                )?;
+                n_edges += insert_edge.execute(rusqlite::params![
+                    repo_id,
+                    file.file_symbol,
+                    target,
+                    "imports"
+                ])?;
             }
         }
     }
@@ -308,11 +350,8 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
                         .get(&(ty, call.callee.clone()))
                         .map(Vec::as_slice)
                 {
-                    n_edges += tx.execute(
-                        "insert or ignore into edges(repo_id, src_symbol_id, dst_symbol_id, kind)
-                         values (?1, ?2, ?3, 'calls')",
-                        rusqlite::params![repo_id, from_id, *only],
-                    )?;
+                    n_edges +=
+                        insert_edge.execute(rusqlite::params![repo_id, from_id, *only, "calls"])?;
                     continue;
                 }
                 unresolved += 1;
@@ -321,17 +360,15 @@ pub fn build(db: &mut Connection, root: &Path) -> Result<BuildStats> {
 
             match extract::resolve(&by_name, from_id, &call.callee) {
                 Some(target) => {
-                    n_edges += tx.execute(
-                        "insert or ignore into edges(repo_id, src_symbol_id, dst_symbol_id, kind)
-                         values (?1, ?2, ?3, 'calls')",
-                        rusqlite::params![repo_id, from_id, target],
-                    )?;
+                    n_edges += insert_edge
+                        .execute(rusqlite::params![repo_id, from_id, target, "calls"])?;
                 }
                 None => unresolved += 1,
             }
         }
     }
 
+    drop(insert_edge);
     tx.commit().context("commit build")?;
     Ok(BuildStats {
         files: files.len(),
@@ -355,13 +392,16 @@ fn load_existing_files(
     tx: &rusqlite::Transaction<'_>,
     repo_id: i64,
 ) -> Result<HashMap<String, ExistingFile>> {
-    let mut statement = tx.prepare("select id, path, hash from files where repo_id=?1")?;
+    let mut statement =
+        tx.prepare("select id, path, hash, mtime, size from files where repo_id=?1")?;
     let rows = statement.query_map([repo_id], |row| {
         Ok((
             row.get::<_, String>(1)?,
             ExistingFile {
                 id: row.get(0)?,
                 hash: row.get(2)?,
+                mtime: row.get(3)?,
+                size: row.get(4)?,
             },
         ))
     })?;
@@ -422,10 +462,68 @@ fn load_cached(
     }))
 }
 
-fn index_file(
+const MIN_FILES_PER_WORKER: usize = 64;
+
+fn extract_changed(
+    files: &[SourceFile],
+    indexes: &[usize],
+    requested_jobs: usize,
+) -> Result<Vec<(usize, extract::Extracted)>> {
+    if indexes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let useful_workers = indexes.len().div_ceil(MIN_FILES_PER_WORKER).max(1);
+    let jobs = requested_jobs.clamp(1, 32).min(useful_workers);
+    let chunk_size = indexes.len().div_ceil(jobs);
+
+    if jobs == 1 {
+        let mut extractor = extract::Extractor::new();
+        return indexes
+            .iter()
+            .map(|&index| {
+                extractor
+                    .extract(files[index].lang, &files[index].text)
+                    .with_context(|| format!("extract {}", files[index].rel))
+                    .map(|extracted| (index, extracted))
+            })
+            .collect();
+    }
+
+    std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(jobs);
+        for chunk in indexes.chunks(chunk_size) {
+            workers.push(
+                scope.spawn(move || -> Result<Vec<(usize, extract::Extracted)>> {
+                    let mut extractor = extract::Extractor::new();
+                    chunk
+                        .iter()
+                        .map(|&index| {
+                            extractor
+                                .extract(files[index].lang, &files[index].text)
+                                .with_context(|| format!("extract {}", files[index].rel))
+                                .map(|extracted| (index, extracted))
+                        })
+                        .collect()
+                }),
+            );
+        }
+
+        let mut extracted = Vec::with_capacity(indexes.len());
+        for worker in workers {
+            let batch = worker
+                .join()
+                .map_err(|_| anyhow!("extraction worker panicked"))??;
+            extracted.extend(batch);
+        }
+        Ok(extracted)
+    })
+}
+
+fn index_extracted(
     tx: &rusqlite::Transaction<'_>,
     repo_id: i64,
     source: &SourceFile,
+    extracted: extract::Extracted,
 ) -> Result<Pending> {
     let file_id = insert_file(tx, repo_id, source)?;
     let lines = source.text.lines().count().max(1) as i64;
@@ -435,8 +533,6 @@ fn index_file(
         rusqlite::params![repo_id, file_id, source.rel, lines, bounded_text(&source.text)],
     )?;
     let file_symbol = tx.last_insert_rowid();
-    let extracted = extract::extract(source.lang, &source.text)
-        .with_context(|| format!("extract {}", source.rel))?;
     let mut symbol_ids = Vec::with_capacity(extracted.symbols.len());
     for (index, symbol) in extracted.symbols.iter().enumerate() {
         let container = extracted.containers.get(index).cloned().flatten();
@@ -780,7 +876,8 @@ pub fn grep_with_options(
     let mut spans: HashMap<String, Vec<SpanRow>> = HashMap::new();
     let mut stmt = db.prepare(
         "select f.path, s.id, s.name, s.kind, s.start_line, s.end_line,
-                (select count(*) from edges e where e.dst_symbol_id = s.id)
+                (select count(*) from edges e
+                  where e.repo_id = s.repo_id and e.dst_symbol_id = s.id)
            from symbols s join files f on f.id = s.file_id
           where s.repo_id = ?1 and s.kind not in ('file','module')",
     )?;
@@ -1013,7 +1110,8 @@ pub fn callers_scoped(
     let sql = format!(
         "select s.id, s.name, s.kind, f.path, s.start_line, s.end_line, e.kind,
                 coalesce(s.signature,''),
-                (select count(*) from edges incoming where incoming.dst_symbol_id=s.id)
+                (select count(*) from edges incoming
+                  where incoming.repo_id=s.repo_id and incoming.dst_symbol_id=s.id)
            from edges e
            join symbols s on s.id = e.{to_col}
            join files f on f.id = s.file_id
@@ -1185,7 +1283,7 @@ pub struct RepoMap {
 /// depend on this" — which is the question a hub answers.
 const HUB_SQL: &str = "select s.name, s.kind, f.path, s.start_line, s.end_line,
         (select count(*) from edges e
-          where e.dst_symbol_id = s.id and e.kind = 'calls') d
+          where e.repo_id = s.repo_id and e.dst_symbol_id = s.id and e.kind = 'calls') d
    from symbols s join files f on f.id = s.file_id
   where s.repo_id = ?1 and s.kind not in ('file','module')";
 
@@ -1605,6 +1703,95 @@ mod tests {
             .query_row("select count(*) from files", [], |row| row.get(0))
             .unwrap();
         assert_eq!(files, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parallel_extraction_preserves_serial_graph_order() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static N: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "graft-parallel-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        for index in 0usize..130 {
+            let previous = index.saturating_sub(1);
+            let body = if index == 0 {
+                "export function item0() { return 0; }\n".to_string()
+            } else {
+                format!(
+                    "import {{ item{previous} }} from './f{previous}';\nexport function item{index}() {{ return item{previous}(); }}\n"
+                )
+            };
+            std::fs::write(root.join(format!("src/f{index}.ts")), body).unwrap();
+        }
+
+        let mut serial = crate::db::open(&root.join("serial.db")).unwrap();
+        let mut parallel = crate::db::open(&root.join("parallel.db")).unwrap();
+        let serial_stats = build_with_jobs(&mut serial, &root, 1).unwrap();
+        let parallel_stats = build_with_jobs(&mut parallel, &root, 4).unwrap();
+        assert_eq!(serial_stats.files, parallel_stats.files);
+        assert_eq!(serial_stats.symbols, parallel_stats.symbols);
+        assert_eq!(serial_stats.edges, parallel_stats.edges);
+
+        fn symbols(db: &Connection) -> Vec<(String, String, String, i64, i64, Option<String>)> {
+            let mut statement = db
+                .prepare(
+                    "select f.path, s.name, s.kind, s.start_line, s.end_line, s.container
+                       from symbols s join files f on f.id=s.file_id
+                      order by f.path, s.id",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        }
+
+        fn edges(db: &Connection) -> Vec<(String, String, String, String, String)> {
+            let mut statement = db
+                .prepare(
+                    "select sf.path, src.name, df.path, dst.name, e.kind
+                       from edges e
+                       join symbols src on src.id=e.src_symbol_id
+                       join files sf on sf.id=src.file_id
+                       join symbols dst on dst.id=e.dst_symbol_id
+                       join files df on df.id=dst.file_id
+                      order by sf.path, src.id, df.path, dst.id, e.kind",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        }
+
+        assert_eq!(symbols(&serial), symbols(&parallel));
+        assert_eq!(edges(&serial), edges(&parallel));
+        drop((serial, parallel));
         let _ = std::fs::remove_dir_all(&root);
     }
 

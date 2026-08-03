@@ -9,11 +9,20 @@
   `mcp`, `init`, `viz`, `export`, `version`, `upgrade`, `completions`, and `cache`.
 - User-level MCP registration only; repository-local Node hooks and tracked
   `.claude` wiring removed.
+- Replaced the required `init` provider argument with an interactive checkbox
+  picker and repeatable `--provider` flags for non-interactive setup. Added an
+  inspect-first local installer that defaults to `~/.local` and never fetches
+  Graft itself.
 - Rust source installation from `wallentx/Graft` branch `dev`; completed the
   native-only cutover by removing the npm CLI mapping, legacy TypeScript package,
   tests, D3 viewer, Node scripts, differential harness, and unreferenced media.
 - Switched dependency updates and CodeQL analysis from npm/TypeScript to
   Cargo/Rust.
+- Added repeatable Termux/Linux performance benchmarks and removed measured hot
+  paths: per-command Git subprocesses, per-file Tree-sitter query compilation,
+  unindexed in-degree subqueries, repeated edge statement preparation, and
+  unchanged metadata writes. Large change sets use bounded parallel extraction
+  with deterministic ordered database insertion and explicit worker controls.
 - Stripped release archives with SHA-256 sidecars, isolated install smoke,
   Termux Bionic-container CI, and an optional real Android/AArch64 runner gate.
 
@@ -102,7 +111,7 @@
 - **`graft init --dry-run`** — print every path `init` would touch, then exit without
   writing. Out-of-repo writes get their own section.
 - **`graft init --no-global`** — skip every write outside the repo. Selecting the
-  `agents` host writes to `~/.codex/config.toml`, `~/.codex/hooks.json`, and
+  `agents` provider writes to `~/.codex/config.toml`, `~/.codex/hooks.json`, and
   `~/.codex/hooks/graft/`; those are user-level and apply to every repo you open with
   Codex, and previously nothing suppressed the `config.toml` write (`--no-hooks` only
   covered the other two). These are now labelled `machine-wide` in the picker.

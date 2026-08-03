@@ -66,7 +66,7 @@ jobs:
           "$GRAFT_BIN" --store "$GRAFT_STORE" status "$smoke" --json
           "$GRAFT_BIN" --store "$GRAFT_STORE" export "$RUNNER_TEMP/export.json" --path "$smoke" --json
           "$GRAFT_BIN" --store "$GRAFT_STORE" viz "$smoke" --output "$RUNNER_TEMP/map.html"
-          HOME="$GRAFT_HOME" "$GRAFT_BIN" init --host codex --dry-run --json
+          HOME="$GRAFT_HOME" "$GRAFT_BIN" init --provider codex --dry-run --json
           test ! -e "$GRAFT_HOME/.codex/config.toml"
           printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | "$GRAFT_BIN" --store "$GRAFT_STORE" mcp "$smoke" | grep -q '"tools"'
           "$GRAFT_BIN" --store "$GRAFT_STORE" grep greet --path "$smoke" | head -n 1 >/dev/null
